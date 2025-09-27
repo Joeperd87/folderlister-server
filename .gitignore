@@ -1,0 +1,19 @@
+data/licenses.json
+data/secrets.JSON
+data/trials.json
+data/
+server (2).zip
+server (3).zip
+server (4).zip
+server (5).zip
+server (6).zip
+server (7).zip
+server.zip
+server/drafts
+client/csv_writer.py
+client/description.py
+client/main.py
+client/uploader.py
+client/__pycache__/csv_writer.cpython-313.pyc
+client/__pycache__/description.cpython-313.pyc
+client/__pycache__/uploader.cpython-313.pyc
