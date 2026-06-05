@@ -1,9 +1,10 @@
 # server/web_editor.py
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
-import os, json, requests
+import os, json, requests, hmac, hashlib, re
 import json
 import glob
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -78,19 +79,39 @@ def _read_cfg() -> dict:
     except Exception:
         return {}
 
+_BASE = Path(__file__).resolve().parent
+_DRAFTS_BASE = _BASE / "drafts"
+_DRAFTS_BASE.mkdir(parents=True, exist_ok=True)
+_LK_HMAC_SECRET = os.getenv("LICENSE_HMAC_SECRET", "CHANGE_ME_DEV_SECRET").encode("utf-8")
+_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+def _draft_bucket_for_lk(raw_lk: str) -> str:
+    raw = str(raw_lk or "").strip()
+    if not raw:
+        return "_anon"
+    digest = hmac.new(_LK_HMAC_SECRET, raw.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"lk_{digest[:48]}"
+
+def _draft_dirs_for_lk(raw_lk: Optional[str]) -> List[Path]:
+    raw = str(raw_lk or "").strip()
+    dirs: List[Path] = [_DRAFTS_BASE / _draft_bucket_for_lk(raw)]
+    if raw and _SAFE_SEGMENT_RE.fullmatch(raw):
+        # legacy/plain folder support (read compatibility only)
+        dirs.append(_DRAFTS_BASE / raw)
+    return dirs
+
 def _latest_draft_path_for(lk: Optional[str]) -> Optional[str]:
-    """
-    Als lk is meegegeven: zoek ALLEEN in server/drafts/<lk>/.
-    Als lk niet is meegegeven: zoek in server/drafts/ (globaal).
-    """
-    base = os.path.join("server", "drafts")
-    if lk:
-        patt = os.path.join(base, lk, "*.json")
-        cands = sorted(glob.glob(patt), key=os.path.getmtime, reverse=True)
-        return cands[0] if cands else None
-    patt = os.path.join(base, "*.json")
-    cands = sorted(glob.glob(patt), key=os.path.getmtime, reverse=True)
-    return cands[0] if cands else None
+    for d in _draft_dirs_for_lk(lk):
+        if not d.exists():
+            continue
+        cands = sorted((p for p in d.glob("draft_*.json") if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not cands:
+            cands = sorted((p for p in d.glob("draft-*.json") if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not cands:
+            cands = sorted((p for p in d.glob("*.json") if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+        if cands:
+            return str(cands[0])
+    return None
 
 def _site_info() -> Dict[str, str]:
     # Lees ALLEEN top-level "site" en "currency" uit config.json
@@ -154,7 +175,7 @@ def web_editor() -> HTMLResponse:
 <html lang="nl">
 <head>
 <meta charset="utf-8">
-<title>Joepienator – Web Editor</title>
+<title>Folder Lister – Web Editor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 <style>
@@ -179,6 +200,7 @@ def web_editor() -> HTMLResponse:
   #bootBanner{position:fixed;top:8px;left:8px;z-index:9999;background:var(--SURFACE_HI);color:var(--TEXT);padding:4px 8px;border-radius:6px;font-size:12px}
   #errOverlay{position:fixed;left:0;right:0;bottom:0;background:#b00020;color:#fff;padding:8px 12px;z-index:10000;display:none;font:12px/1.4 system-ui,Segoe UI,Roboto,Arial}
   #errOverlay pre{white-space:pre-wrap;margin:0}
+  #reviseBanner{display:none;background:#d97706;color:#1c1c1c;padding:3px 12px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.2px}
 
   header{background:var(--SURFACE);color:var(--TEXT);padding:10px 12px;display:flex;align-items:center;gap:12px;border-bottom:2px solid var(--SURFACE_HI)}
   header img{height:28px;display:block}
@@ -233,10 +255,20 @@ def web_editor() -> HTMLResponse:
   .colAspect{min-width:220px}
   .policy-select{ min-width:240px; }
 
+  /* per-category sections (single-mode) */
+  .cat-section-hdr{
+    padding:6px 10px; margin:10px 0 0 0;
+    background:var(--SURFACE_ELEV); color:var(--ACCENT);
+    font-weight:600; font-size:13px; border-radius:6px 6px 0 0;
+    border-left:3px solid var(--ACCENT);
+  }
+  .cat-section-table{ margin-bottom:18px; }
+
   .toolbar-check{display:inline-flex;align-items:center;gap:8px;margin-left:8px}
 
   /* overlay dialog */
   .dlg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:50}
+  #dlgImages{z-index:60}
   .dlg .card{background:#0f2e36;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.35);max-width:900px;width:min(90vw,1100px);color:var(--TEXT)}
   .card header{background:var(--SURFACE_ELEV);color:var(--TEXT);border-bottom:1px solid var(--BORDER);padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
   .card .body{padding:12px 14px;max-height:70vh;overflow:auto}
@@ -252,6 +284,23 @@ def web_editor() -> HTMLResponse:
   #pubOverlay .box{background:var(--SURFACE_ELEV);color:var(--TEXT);padding:18px 22px;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.4);display:flex;align-items:center;gap:12px}
   .spinner{width:18px;height:18px;border:3px solid #ffffff55;border-top-color:var(--ACCENT);border-radius:50%;animation:spin 1s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+    #pubOverlay .col{display:flex;flex-direction:column;gap:6px;flex:1}
+  .pub-prog{
+    width:260px;
+    max-width:100%;
+    height:6px;
+    border-radius:999px;
+    background:#ffffff22;
+    overflow:hidden;
+    margin-top:6px;
+  }
+  .pub-prog .inner{
+    height:100%;
+    width:0%;
+    background:var(--ACCENT);
+    transition:width .25s ease-out;
+  }
+
 </style>
 </head>
 <body>
@@ -259,9 +308,11 @@ def web_editor() -> HTMLResponse:
 <div id="errOverlay"><pre id="errText"></pre></div>
 
 <header>
-  <img src="/static/logo.png" alt="logo" onerror="this.style.display='none'">
-  <h1>Joepienator – Web Editor</h1>
+  <img src="/images/folder_lister_logo.png" alt="logo" onerror="this.style.display='none'">
+  <h1>FolderLister – Web Editor</h1>
   <span id="site" class="pill">…</span>
+  <span id="modeBadge" class="pill" style="display:none">MultiListing</span>
+  <span id="reviseBanner">✏️ EDIT MODE — revising existing listing</span>
 </header>
 
 <div id="controls">
@@ -272,6 +323,8 @@ def web_editor() -> HTMLResponse:
   <label class="toolbar-check"><input id="checkAll" type="checkbox" checked> Check all</label>
   <label class="toolbar-check"><input id="toggleHidden" type="checkbox" checked> Show hidden fields</label>
   <button id="btnColumns">Columns</button>
+  <button id="btnVariations" style="display:none">Variations…</button>
+  <button id="btnTogglePublished" style="display:none" title="Toon/verberg al gepubliceerde items van deze sessie">Show published (0)</button>
 
   <!-- BULK editor -->
   <div style="flex-basis:100%"></div>
@@ -285,7 +338,74 @@ def web_editor() -> HTMLResponse:
   <span id="status" class="muted" style="margin-left:auto"></span>
 </div>
 
+<!-- Quick-post setup (shown when seller has no eBay business policies) -->
+<div id="quickPostPanel" style="display:none;background:#1a3d2a;border-bottom:2px solid #FDB913;padding:10px 16px;color:#e6f0e8;font-size:13px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+    <span style="font-weight:700;color:#FDB913">Quick post setup</span>
+    <span style="opacity:.8">No eBay business policies found for <strong id="qpSite"></strong>. Fill these in to publish right away — they apply to all rows.</span>
+    <a id="qpEbayLink" href="#" target="_blank" style="color:#ffd;text-decoration:underline;white-space:nowrap;margin-left:auto">Or create proper policies on eBay →</a>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end">
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Shipping service <span style="color:#ff6">*</span></span>
+      <select id="qpShipService"></select>
+    </label>
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Shipping cost (<span id="qpCurSym">€</span>) <span style="color:#ff6">*</span></span>
+      <input id="qpShipCost" type="number" min="0" step="0.01" placeholder="6.95">
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;padding-bottom:6px">
+      <input id="qpFreeShip" type="checkbox"> Free shipping
+    </label>
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Handling time (days) <span style="color:#ff6">*</span></span>
+      <select id="qpDispatch">
+        <option value="1">1</option><option value="2" selected>2</option>
+        <option value="3">3</option><option value="5">5</option>
+        <option value="10">10</option>
+      </select>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;padding-bottom:6px">
+      <input id="qpReturns" type="checkbox" checked> Accept returns
+    </label>
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Return period</span>
+      <select id="qpReturnDays">
+        <option value="14">14 days</option>
+        <option value="30" selected>30 days</option>
+        <option value="60">60 days</option>
+      </select>
+    </label>
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Return shipping paid by</span>
+      <select id="qpReturnPayer">
+        <option value="Buyer" selected>Buyer</option>
+        <option value="Seller">Seller</option>
+      </select>
+    </label>
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Location (city) <span style="color:#ff6">*</span></span>
+      <input id="qpLocation" type="text" placeholder="Amsterdam">
+    </label>
+    <label style="display:flex;flex-direction:column;gap:2px">
+      <span>Postal code <span style="color:#ff6">*</span></span>
+      <input id="qpPostal" type="text" placeholder="1011AB">
+    </label>
+  </div>
+  <div id="qpError" style="display:none;margin-top:8px;color:#ffb3b3;font-weight:600"></div>
+</div>
+
 <div id="grid"></div>
+
+<!-- Big loading overlay (shown while /web/draft fetches and rows render) -->
+<div id="loadingOverlay" style="position:fixed;inset:0;background:rgba(15,29,35,.78);display:none;align-items:center;justify-content:center;z-index:9999;flex-direction:column;gap:14px;color:#fff;font-family:Inter,system-ui,sans-serif">
+  <div style="width:54px;height:54px;border:5px solid rgba(255,255,255,.18);border-top-color:#f0cf6d;border-radius:50%;animation:flSpin 0.85s linear infinite"></div>
+  <div id="loadingOverlayText" style="font-size:15px;font-weight:600;letter-spacing:.02em">Loading draft…</div>
+  <div id="loadingOverlaySub" style="font-size:12px;color:#b8cdd4;max-width:420px;text-align:center;line-height:1.5">Fetching listings from the server. Larger drafts can take a few seconds.</div>
+</div>
+<style>
+  @keyframes flSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+</style>
 
 <!-- Image manager dialog -->
 <div id="dlgImages" class="dlg" role="dialog" aria-modal="true">
@@ -309,6 +429,46 @@ def web_editor() -> HTMLResponse:
   </div>
 </div>
 
+<!-- Variations dialog -->
+<div id="dlgVars" class="dlg" role="dialog" aria-modal="true">
+  <div class="card" style="max-width:1100px">
+    <header>
+      <h3>Variations</h3>
+      <button id="varClose">Close</button>
+    </header>
+    <div class="body">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+        <label>Attribute 1 name<br><input id="varName1" type="text" style="min-width:220px"></label>
+        <label>Attribute 2 name (optional)<br><input id="varName2" type="text" style="min-width:220px"></label>
+        <label>Picture attribute<br><select id="varPicName" style="min-width:180px"></select></label>
+        <button id="varApplyNames">Apply names</button>
+        <button id="varAdd">Add variation</button>
+      </div>
+
+      <div style="overflow:auto;max-height:55vh;border:1px solid #222;border-radius:12px">
+        <table class="grid" style="width:100%">
+          <thead>
+            <tr>
+              <th style="width:28px" title="Sleep rijen om volgorde te wijzigen">&#9776;</th>
+              <th style="width:140px">SKU</th>
+              <th style="width:180px" id="thA1">Attr1</th>
+              <th style="width:180px" id="thA2">Attr2</th>
+              <th style="width:110px">Price</th>
+              <th style="width:80px">Qty</th>
+              <th style="width:120px">Images</th>
+              <th style="width:90px"></th>
+            </tr>
+          </thead>
+          <tbody id="varTbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <footer>
+      <button id="varDone" class="dark">Done</button>
+    </footer>
+  </div>
+</div>
+
 <!-- Columns dialog -->
 <div id="dlgColumns" class="dlg" role="dialog" aria-modal="true">
   <div class="card">
@@ -327,7 +487,20 @@ def web_editor() -> HTMLResponse:
 </div>
 
 <!-- Publish overlay -->
-<div id="pubOverlay"><div class="box"><div class="spinner"></div><div id="pubText">Publishing…</div></div></div>
+<!-- Publish overlay -->
+<div id="pubOverlay">
+  <div class="box">
+    <div class="spinner"></div>
+    <div class="col">
+      <div id="pubText">Publishing…</div>
+      <div id="pubProg" class="pub-prog">
+        <div class="inner"></div>
+      </div>
+      <div id="pubProgLabel" class="muted" style="font-size:12px;margin-top:2px;text-align:right"></div>
+    </div>
+  </div>
+</div>
+
 
 <script>
 (function(){
@@ -351,8 +524,33 @@ def web_editor() -> HTMLResponse:
   const CONDITIONS_CACHE = {}; // key: SITE|categoryId -> [{id,name,label,allow_description}]
   let SITE = 'NL';
   let CURRENCY = 'EUR';
+  let _noPolicies = false; // set true when no business policies found for this site
+  const _EBAY_DOMAIN = {
+    NL:'www.ebay.nl', DE:'www.ebay.de', UK:'www.ebay.co.uk', GB:'www.ebay.co.uk',
+    US:'www.ebay.com', FR:'www.ebay.fr', IT:'www.ebay.it', ES:'www.ebay.es',
+    BE:'www.ebay.be', AT:'www.ebay.at', AU:'www.ebay.com.au', CA:'www.ebay.ca',
+    PL:'www.ebay.pl', CH:'www.ebay.ch', IE:'www.ebay.ie',
+  };
+  function _ebayPoliciesUrl(site){
+    const dom = _EBAY_DOMAIN[site] || 'www.ebay.com';
+    return 'https://' + dom + '/bp/manage';
+  }
   let lastRows = [];
+  let showPublishedRows = false; // false = published items hidden, true = visible (toggled)
+  function updatePublishedToggle() {
+    const btn = document.getElementById('btnTogglePublished');
+    if (!btn) return;
+    const n = (lastRows || []).filter(r => r && r._published).length;
+    if (n === 0) {
+      btn.style.display = 'none';
+      return;
+    }
+    btn.style.display = '';
+    btn.textContent = (showPublishedRows ? 'Hide published (' : 'Show published (') + n + ')';
+  }
   let table, cols;
+  let catSections = [];   // [{catId, catDisplay, rows, cols, table}] – single-mode only
+  let singleModeActive = false;
   let INTERVAL_MIN = 0;
   let GLOBAL_START_DT = null; // Date of null
 
@@ -369,6 +567,19 @@ def web_editor() -> HTMLResponse:
   // ------------------- utils -------------------
   function $(id){ return document.getElementById(id); }
   function status(msg){ const el=$('status'); if(el) el.textContent = msg || ''; }
+  function showLoading(msg, sub){
+    const ov = document.getElementById('loadingOverlay');
+    const tx = document.getElementById('loadingOverlayText');
+    const sb = document.getElementById('loadingOverlaySub');
+    if (!ov) return;
+    if (tx && msg !== undefined) tx.textContent = msg || 'Loading…';
+    if (sb && sub !== undefined) sb.textContent = sub || '';
+    ov.style.display = 'flex';
+  }
+  function hideLoading(){
+    const ov = document.getElementById('loadingOverlay');
+    if (ov) ov.style.display = 'none';
+  }
   function jsonError(r){
     return r.text().then(tx => {
       try { const j = JSON.parse(tx); throw new Error(j.detail || tx); }
@@ -477,14 +688,12 @@ function postJSON(url, body){
   // ------------------- site/policies/aspects/conditions -------------------
   function loadSite(){
     return getJSON('/account/site')
-      .then(js => {
-        SITE = (js.site_code || 'NL').toUpperCase();
-        CURRENCY = (js.currency || 'EUR').toUpperCase();
-        const s = $('site');
-        if (s) s.textContent = SITE + ' (' + CURRENCY + ')';
-      })
-      .catch(() => {});
-  }
+    .then(js => {
+      console.log('Account site info (ignored):', js);
+      // SITE/CURRENCY NIET meer aanpassen hier
+    })
+    .catch(err => console.warn('detectAccountSite failed', err));
+}
 
   function normalizeAspectPayload(js){
     const out = {};
@@ -513,6 +722,137 @@ function postJSON(url, body){
     return out;
   }
 
+  // ─── Quick-post setup (inline policies for sellers without business policies) ────────────
+  // Per-site default shipping services. Must match _INLINE_SHIPPING_DEFAULTS in app.py.
+  // Shipping services come from the server (GeteBayDetails, filtered by
+  // seller country + cross-border direction). Cached in memory per site.
+  // Static fallback only used if the network call fails — "Other" alone
+  // is universally accepted by eBay, so it's a safe minimum.
+  const QP_SHIP_FALLBACK = [['Other','Other (universal)']];
+  const QP_SHIP_CACHE = {}; // site → [[value, label], ...]
+  function _qpFetchShippingServices(site){
+    if (QP_SHIP_CACHE[site]) return Promise.resolve(QP_SHIP_CACHE[site]);
+    return getJSON('/web/shipping_services?site='+encodeURIComponent(site))
+      .then(js => {
+        const list = (js && Array.isArray(js.services)) ? js.services : [];
+        const pairs = list.map(s => [s.service, s.description || s.service]);
+        if (!pairs.length) return QP_SHIP_FALLBACK;
+        QP_SHIP_CACHE[site] = pairs;
+        return pairs;
+      })
+      .catch(() => QP_SHIP_FALLBACK);
+  }
+  const CURRENCY_SYMBOL = { EUR:'€', GBP:'£', USD:'$', PLN:'zł', CHF:'CHF', CAD:'CA$', AUD:'A$' };
+
+  function _qpLocalStorageKey(site){ return 'qp_defaults_' + (site||'NL').toUpperCase(); }
+  function _qpLoadDefaults(site){
+    try {
+      const raw = localStorage.getItem(_qpLocalStorageKey(site));
+      if (raw) return JSON.parse(raw) || {};
+    } catch(_){}
+    return {};
+  }
+  function _qpSaveDefaults(site, obj){
+    try { localStorage.setItem(_qpLocalStorageKey(site), JSON.stringify(obj || {})); } catch(_){}
+  }
+
+  function _qpPopulateShippingDropdown(){
+    const sel = document.getElementById('qpShipService');
+    if (!sel) return;
+    // Show "Loading..." until the GeteBayDetails fetch returns; the
+    // catalogue is cached after the first call so subsequent opens
+    // are instant.
+    sel.innerHTML = '';
+    sel.appendChild(new Option('Loading shipping services…', '', true, true));
+    _qpFetchShippingServices(SITE).then(opts => {
+      sel.innerHTML = '';
+      for (const [val, lbl] of opts) {
+        sel.appendChild(new Option(lbl, val));
+      }
+      // Re-apply persisted defaults now the list is populated.
+      try { _qpApplyDefaults(); } catch(_){}
+    });
+  }
+
+  function _qpApplyDefaults(){
+    const d = _qpLoadDefaults(SITE);
+    const set = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined && val !== null && val !== '') el.value = val; };
+    const setChk = (id, val) => { const el = document.getElementById(id); if (el && typeof val === 'boolean') el.checked = val; };
+    set('qpShipService', d.shipping_service);
+    set('qpShipCost', d.shipping_cost);
+    setChk('qpFreeShip', !!d.free_shipping);
+    set('qpDispatch', d.dispatch_time_max);
+    if (typeof d.returns_accepted === 'boolean') setChk('qpReturns', d.returns_accepted);
+    set('qpReturnDays', d.return_period_days);
+    set('qpReturnPayer', d.return_shipping_paid_by);
+    set('qpLocation', d.location);
+    set('qpPostal', d.postal_code);
+  }
+
+  function _qpCollect(){
+    const free = !!document.getElementById('qpFreeShip').checked;
+    return {
+      inline_policies: true,
+      shipping_service: document.getElementById('qpShipService').value || 'Other',
+      shipping_cost: free ? 0 : (parseFloat(document.getElementById('qpShipCost').value) || 0),
+      free_shipping: free,
+      dispatch_time_max: parseInt(document.getElementById('qpDispatch').value, 10) || 3,
+      returns_accepted: !!document.getElementById('qpReturns').checked,
+      return_period_days: parseInt(document.getElementById('qpReturnDays').value, 10) || 30,
+      return_shipping_paid_by: document.getElementById('qpReturnPayer').value || 'Buyer',
+      location: (document.getElementById('qpLocation').value || '').trim(),
+      postal_code: (document.getElementById('qpPostal').value || '').trim(),
+    };
+  }
+
+  function _qpValidate(){
+    const v = _qpCollect();
+    const issues = [];
+    if (!v.shipping_service) issues.push('Shipping service');
+    if (!v.free_shipping && !(v.shipping_cost >= 0)) issues.push('Shipping cost');
+    if (!(v.dispatch_time_max > 0)) issues.push('Handling time');
+    if (!v.location) issues.push('Location');
+    if (!v.postal_code) issues.push('Postal code');
+    const err = document.getElementById('qpError');
+    if (issues.length) {
+      err.textContent = 'Still missing: ' + issues.join(', ');
+      err.style.display = '';
+      return null;
+    }
+    err.style.display = 'none';
+    return v;
+  }
+
+  // Per-site postcode hints — eBay rejects letters in DE/US/PL postcodes.
+  const QP_POSTAL_HINTS = {
+    NL: '1011AB', BE: '1000', DE: '10115', FR: '75001', IT: '00100',
+    ES: '28001', AT: '1010', UK: 'SW1A 1AA', GB: 'SW1A 1AA',
+    US: '10001', IE: 'D01 ABCD', PL: '00-001', CH: '8001',
+  };
+
+  function _showQuickPostPanel(show){
+    _noPolicies = show;
+    const panel = document.getElementById('quickPostPanel');
+    if (!panel) return;
+    if (show) {
+      document.getElementById('qpSite').textContent = SITE;
+      const lnk = document.getElementById('qpEbayLink');
+      if (lnk) lnk.href = _ebayPoliciesUrl(SITE);
+      const sym = CURRENCY_SYMBOL[CURRENCY] || CURRENCY;
+      const cs = document.getElementById('qpCurSym'); if (cs) cs.textContent = sym;
+      const pc = document.getElementById('qpPostal');
+      if (pc) pc.placeholder = QP_POSTAL_HINTS[SITE] || '';
+      _qpPopulateShippingDropdown();
+      _qpApplyDefaults();
+      panel.style.display = '';
+    } else {
+      panel.style.display = 'none';
+    }
+  }
+
+  // Kept for backward compat with older code paths that may call this name.
+  function _showNoPoliciesBanner(show){ _showQuickPostPanel(show); }
+
   function loadPolicies(){
     return getJSON('/web/policies?site='+encodeURIComponent(SITE)+'&prefer_store=trading')
       .then(js => {
@@ -520,6 +860,11 @@ function postJSON(url, body){
         POL.ret = js.return || [];
         POL.pay = js.payment || [];
         POL.store_categories = js.store_categories || [];
+        // Authoritative no-policies check via dedicated endpoint (cheaper +
+        // avoids racing with store-category fetches in /web/policies).
+        getJSON('/web/policies/status?site='+encodeURIComponent(SITE))
+          .then(st => { _showQuickPostPanel(!(st && st.has_any)); })
+          .catch(() => { _showQuickPostPanel(!POL.shipping.length && !POL.ret.length && !POL.pay.length); });
       })
       .catch(() => {})
       .then(() => {
@@ -645,6 +990,12 @@ function conditionAllowsDescription(label, allowedList){
       {title:'Qty', key:'quantity', type:'int', cls:'colSmall', sortable:true},
       {title:'Start price', key:'price', type:'num', cls:'colPrice', sortable:true},
     ];
+
+    // If this draft contains variations, show an explicit column.
+    const hasVars = (rows || []).some(r => Array.isArray(r.variations) && r.variations.length > 0);
+    if(hasVars){
+      cols.push({title:'Variations', key:'_vars', type:'vars', cls:'colSmall', sortable:false});
+    }
     for (const k of aspectKeys){
       cols.push({title:k, key:'aspects.'+k, type:'aspect', cls:'colAspect', sortable:true});
     }
@@ -680,13 +1031,97 @@ function conditionAllowsDescription(label, allowedList){
     ];
   }
 
+  // When the seller has no listing-settings profile on any row, force
+  // these columns to stay visible regardless of SHOW_HIDDEN /
+  // hiddenColsPref — otherwise the user has nowhere to set auction vs
+  // fixed-price, listing duration, BIN price or scheduled start.
+  const QP_FORCE_VISIBLE_KEYS = ['format','duration','buy_it_now_price','schedule_time'];
+
+  function _anyRowHasProfile(rows){
+    return (rows || []).some(r => r && (
+      String(r.shipping_profile || '').trim() ||
+      String(r.return_profile   || '').trim() ||
+      String(r.payment_profile  || '').trim()
+    ));
+  }
+
   function buildColumns(rows){
     const base = baseColumns(rows);
     const adv = extraColumns();
     const merged = SHOW_HIDDEN ? base.concat(adv) : base;
+    const noProfileMode = _noPolicies || !_anyRowHasProfile(rows);
+    const forced = noProfileMode ? QP_FORCE_VISIBLE_KEYS : [];
+
+    // If columns we want to force aren't already in the visible list
+    // (e.g. SHOW_HIDDEN is off), splice them in from extraColumns.
+    if (forced.length && !SHOW_HIDDEN) {
+      const have = new Set(merged.map(c => c.key));
+      for (const c of adv) {
+        if (forced.indexOf(c.key) !== -1 && !have.has(c.key)) merged.push(c);
+      }
+    }
+
     return merged.filter(c =>
-      c.key === '_sel' || c.key === '_thumb' || hiddenColsPref.indexOf(c.key) === -1
+      c.key === '_sel' || c.key === '_thumb' ||
+      forced.indexOf(c.key) !== -1 ||              // bypass user-hide pref for critical cols
+      hiddenColsPref.indexOf(c.key) === -1
     );
+  }
+
+  // ------------------- single-mode helpers -------------------
+  function isSingleMode(rows){
+    return (rows || []).some(r => r.row_schema_version === 2);
+  }
+
+  function baseColumnsNoAspects(rows){
+    return buildColumns(rows).filter(c => c.type !== 'aspect');
+  }
+
+  function aspectColumnsForRows(rowsForCat){
+    const seen = {};
+    for (const r of rowsForCat){
+      const a = r.aspects || {};
+      for (const k in a){ if (k.indexOf('C:') === 0) seen[k] = 1; }
+    }
+    return Object.keys(seen).sort().map(k => ({
+      title: k, key: 'aspects.'+k, type:'aspect', cls:'colAspect', sortable:true
+    }));
+  }
+
+  function renderSingleModeTables(rows, grid){
+    const groups = {};
+    const order = [];
+    for (const r of rows){
+      const catId = String(r.category_id || '');
+      if (!groups[catId]){
+        const catDisplay = r.category_display || r.category_name || catId || '(no category)';
+        groups[catId] = {catId, catDisplay, rows: []};
+        order.push(catId);
+      }
+      groups[catId].rows.push(r);
+    }
+    catSections = [];
+    for (const catId of order){
+      const g = groups[catId];
+      const hdr = document.createElement('div');
+      hdr.className = 'cat-section-hdr';
+      hdr.textContent = g.catDisplay + (g.catId ? '  [' + g.catId + ']' : '');
+      grid.appendChild(hdr);
+
+      const baseCols = baseColumnsNoAspects(rows);
+      const aspCols = aspectColumnsForRows(g.rows);
+      const secCols = baseCols.concat(aspCols);
+
+      const tbl = document.createElement('table');
+      tbl.className = 'cat-section-table';
+      tbl.appendChild(document.createElement('thead'));
+      tbl.appendChild(document.createElement('tbody'));
+      buildHeader(tbl, secCols);
+      grid.appendChild(tbl);
+
+      const sec = {catId, catDisplay: g.catDisplay, rows: g.rows, cols: secCols, table: tbl};
+      catSections.push(sec);
+    }
   }
 
   // ------------------- render -------------------
@@ -709,15 +1144,27 @@ function conditionAllowsDescription(label, allowedList){
     theTable.tHead.appendChild(tr);
   }
 
-  function renderBody(){
-    const tbody = table.tBodies[0];
+  function renderBody(secOverride){
+    // In single-mode with no explicit section, re-render all sections
+    if (!secOverride && singleModeActive){
+      for (const sec of catSections) renderBody(sec);
+      return;
+    }
+    const allTargetRows = secOverride ? secOverride.rows        : lastRows;
+    // Verberg in deze sessie al gepubliceerde rijen, tenzij gebruiker ze wil zien
+    const targetRows  = (typeof showPublishedRows !== 'undefined' && showPublishedRows)
+                        ? allTargetRows
+                        : allTargetRows.filter(r => !(r && r._published));
+    const targetCols  = secOverride ? secOverride.cols        : cols;
+    const tbody       = secOverride ? secOverride.table.tBodies[0] : table.tBodies[0];
     tbody.innerHTML = '';
-    for (let i=0;i<lastRows.length;i++){
-      const r = lastRows[i];
+    for (let i=0;i<targetRows.length;i++){
+      const r = targetRows[i];
       const tr = document.createElement('tr');
+      tr.__rowObj = r;
 
-      for (let ci=0; ci<cols.length; ci++){
-        const c = cols[ci];
+      for (let ci=0; ci<targetCols.length; ci++){
+        const c = targetCols[ci];
         const td = document.createElement('td');
         if (c.cls) td.classList.add(c.cls);
         if (c.sticky){
@@ -759,12 +1206,29 @@ function conditionAllowsDescription(label, allowedList){
             put(wrap); return;
           }
 
+          if (col.type === 'vars'){
+            const n = (row && Array.isArray(row.variations)) ? row.variations.length : 0;
+            const wrap = document.createElement('div');
+            const btn = document.createElement('button');
+            btn.textContent = n ? `Edit (${n})` : 'Edit';
+            btn.disabled = !n;
+            btn.addEventListener('click', () => openVarDlg(row));
+            wrap.appendChild(btn);
+            put(wrap); return;
+          }
+
           if (col.type === 'textarea'){
             const box = document.createElement('div');
             const ta = document.createElement('textarea');
             ta.style.width = '100%';
             ta.value = row[col.key] || '';
-            ta.addEventListener('input', () => { row[col.key] = ta.value; });
+            ta.addEventListener('input', () => {
+              row[col.key] = ta.value;
+              // User edited the description → server must actually
+              // send the new content on revise (default is to skip
+              // <Description> to avoid eBay's content-filter 240).
+              if (col.key === 'description_html') row.description_changed = true;
+            });
 
             const tools = document.createElement('div');
             tools.style.display='flex'; tools.style.gap='8px'; tools.style.marginTop='4px';
@@ -788,6 +1252,11 @@ function conditionAllowsDescription(label, allowedList){
           }
 
           if (col.type === 'num'){
+            if ((col.key === 'price') && (typeof ismulti === 'function') && ismulti(row)) {
+              const d = document.createElement('div'); d.className='muted'; d.textContent='—';
+              d.title = 'Price is set per variation';
+              put(d); return;
+            }
             const np = document.createElement('input'); np.type='number'; np.step='0.01'; np.className='num';
             np.value = (row[col.key] != null ? row[col.key] : '');
             np.addEventListener('input', () => { row[col.key] = (np.value === '' ? null : parseFloat(np.value)); });
@@ -795,6 +1264,11 @@ function conditionAllowsDescription(label, allowedList){
           }
 
           if (col.type === 'int'){
+            if ((col.key === 'quantity') && (typeof ismulti === 'function') && ismulti(row)) {
+              const d = document.createElement('div'); d.className='muted'; d.textContent='—';
+              d.title = 'Quantity is set per variation';
+              put(d); return;
+            }
             const ip = document.createElement('input'); ip.type='number'; ip.step='1'; ip.min='0'; ip.className='intonly num';
             ip.value = (row[col.key] != null ? row[col.key] : '');
             ip.addEventListener('input', () => {
@@ -827,6 +1301,9 @@ function conditionAllowsDescription(label, allowedList){
                 sel.value = norm;
                 sel.addEventListener('change', () => {
                   row[col.key] = sel.value;
+                  // Flag so the server actually sends <ConditionID> on
+                  // revise (default = skip, eBay keeps existing).
+                  row.condition_changed = true;
                   const can = conditionAllowsDescription(sel.value, allowed);
                   const input = rowTr.querySelector('textarea[data-col="condition_description"],input[data-col="condition_description"]');
                   if (input){ input.disabled = !can; if (!can) input.value=''; }
@@ -839,7 +1316,10 @@ function conditionAllowsDescription(label, allowedList){
                 ];
                 for (const v of vals) sel.appendChild(new Option(v, v));
                 sel.value = row[col.key] || '';
-                sel.addEventListener('change', () => { row[col.key] = sel.value; });
+                sel.addEventListener('change', () => {
+                  row[col.key] = sel.value;
+                  row.condition_changed = true;
+                });
               }
             }
             else if (col.key === 'format'){
@@ -988,7 +1468,8 @@ function conditionAllowsDescription(label, allowedList){
 
     const ca = $('checkAll');
     if (ca && ca.checked){
-      document.querySelectorAll('input.rowSel').forEach(cb => cb.checked = true);
+      const scope = secOverride ? secOverride.table : document;
+      scope.querySelectorAll('input.rowSel').forEach(cb => cb.checked = true);
     }
   }
 
@@ -996,11 +1477,23 @@ function conditionAllowsDescription(label, allowedList){
     const grid = $('grid');
     if (!grid){ console.warn('#grid ontbreekt'); return; }
     grid.innerHTML = '';
+    catSections = [];
+    singleModeActive = false;
 
     if (!rows || !rows.length){
       grid.innerHTML = '<div style="padding:12px;color:#9bbbc4;">Geen rijen om te tonen.</div>';
       return;
     }
+
+    if (isSingleMode(rows)){
+      singleModeActive = true;
+      renderSingleModeTables(rows, grid);
+      for (const sec of catSections) renderBody(sec);
+      buildColumnsDialog();
+      buildBulkFieldList();
+      return;
+    }
+
     cols = buildColumns(rows);
     table = document.createElement('table');
     const thead = document.createElement('thead'); const tbody = document.createElement('tbody');
@@ -1013,33 +1506,45 @@ function conditionAllowsDescription(label, allowedList){
   }
 
   // ------------------- sort/select -------------------
+  function _cmpVal(x, key){
+    if (key.indexOf('aspects.') === 0){ const nm = key.slice(8); return (x.aspects || {})[nm] || ''; }
+    return x[key] || '';
+  }
+
   function sortBy(key){
     let dir = 1;
     if (sortState.key === key) dir = -sortState.dir;
     sortState.key = key; sortState.dir = dir;
 
-    lastRows.sort((a,b) => {
-      function val(x){
-        if (key.indexOf('aspects.') === 0){
-          const nm = key.slice(8); return (x.aspects || {})[nm] || '';
-        }
-        return x[key] || '';
-      }
-      const va = val(a), vb = val(b);
+    const cmp = (a, b) => {
+      const va = _cmpVal(a, key), vb = _cmpVal(b, key);
       const na = parseFloat(va), nb = parseFloat(vb);
       if (!isNaN(na) && !isNaN(nb)) return dir * (na - nb);
       return dir * String(va).localeCompare(String(vb));
-    });
+    };
+
+    if (singleModeActive){
+      for (const sec of catSections){ sec.rows.sort(cmp); renderBody(sec); }
+      return;
+    }
+    lastRows.sort(cmp);
     renderBody();
   }
 
   function selectedRows(){
     const out = [];
+    // single-mode: scan all section tables via __rowObj on each TR
+    if (singleModeActive){
+      document.querySelectorAll('#grid input.rowSel').forEach(cb => {
+        if (cb.checked){ const tr = cb.closest('tr'); if (tr && tr.__rowObj) out.push(tr.__rowObj); }
+      });
+      return out;
+    }
     if (!table || !table.tBodies[0]) return out;
     const trs = table.tBodies[0].rows;
     for (let i=0;i<trs.length;i++){
       const cb = trs[i].querySelector('input.rowSel');
-      if (cb && cb.checked) out.push(lastRows[i]);
+      if (cb && cb.checked) out.push(trs[i].__rowObj || lastRows[i]);
     }
     return out;
   }
@@ -1072,6 +1577,19 @@ function conditionAllowsDescription(label, allowedList){
   function closeColumns(){ $('dlgColumns').style.display='none'; }
 
   $('btnColumns').addEventListener('click', openColumns);
+  $('btnVariations').addEventListener('click', () => {
+    const r = selectedRows().find(x => x && Array.isArray(x.variations) && x.variations.length) || (lastRows || []).find(x => x && Array.isArray(x.variations) && x.variations.length);
+    if (r) openVarDlg(r);
+    else alert('No variations in current draft.');
+  });
+  $('varClose').addEventListener('click', closeVarDlg);
+  $('varDone').addEventListener('click', closeVarDlg);
+  $('varApplyNames').addEventListener('click', applyVarNames);
+  $('varAdd').addEventListener('click', addVariation);
+  $('varPicName').addEventListener('change', () => {
+    if (CURRENT_VAR_ROW) CURRENT_VAR_ROW.variation_picture_name = $('varPicName').value;
+  });
+
   $('colClose').addEventListener('click', closeColumns);
   $('colReset').addEventListener('click', () => {
     hiddenColsPref = [];
@@ -1198,7 +1716,14 @@ function conditionAllowsDescription(label, allowedList){
 
     for (let r of rows){
       if (field.indexOf('aspects.') === 0){
-        const k = field.slice(8); r.aspects = r.aspects || {}; r.aspects[k] = valRaw || null;
+        const k = field.slice(8); // Aspects: prefer r.aspects; fallback to item_specifics/specifics (dict only)
+let asp = r.aspects;
+if (!asp || typeof asp !== 'object' || Array.isArray(asp)) asp = null;
+if (!asp){
+  const cand = r.item_specifics ?? r.specifics ?? r.ItemSpecifics ?? null;
+  if (cand && typeof cand === 'object' && !Array.isArray(cand)) asp = cand;
+}
+r.aspects = asp || {}; r.aspects[k] = valRaw || null;
       } else if (field === 'quantity'){
         r.quantity = parseInt(valRaw || '0', 10) || 0;
       } else if (field === 'price' || field === 'buy_it_now_price' || field==='reserve_price' || field === 'vat_percent'){
@@ -1225,6 +1750,255 @@ function conditionAllowsDescription(label, allowedList){
     renderImgList();
   }
   function closeImageDlg(){ $('dlgImages').style.display='none'; CURRENT_IMG_ROW = null; }
+
+  // --- Variations editor (MultiListing) ---
+  let CURRENT_VAR_ROW = null;
+  let VAR_OLD_NAMES = [];
+
+  function _rowHasVars(r){
+    return r && Array.isArray(r.variations) && r.variations.length > 0;
+  }
+
+  // Backward-compat alias: older builds referenced `ismulti(row)`.
+  function ismulti(r){
+    return _rowHasVars(r);
+  }
+  function updateVarButton(){
+    const btn = $('btnVariations');
+    if(!btn) return;
+    const has = (lastRows || []).some(r => _rowHasVars(r));
+    btn.style.display = has ? '' : 'none';
+    btn.disabled = !has;
+    const mb = $('modeBadge');
+    if(mb) mb.style.display = has ? '' : 'none';
+  }
+
+  function openVarDlg(row){
+    if(!_rowHasVars(row)){ alert('This row has no variations.'); return; }
+    CURRENT_VAR_ROW = row;
+    VAR_OLD_NAMES = Array.isArray(row.variation_names) ? row.variation_names.slice(0) : [];
+    $('dlgVars').style.display = 'flex';
+    renderVarDlg();
+  }
+  function closeVarDlg(){
+    $('dlgVars').style.display = 'none';
+    CURRENT_VAR_ROW = null;
+    VAR_OLD_NAMES = [];
+    updateVarButton();
+    renderBody();
+  }
+
+  function _inferVarNames(row){
+    const names = Array.isArray(row.variation_names) ? row.variation_names.slice(0) : [];
+    if(names.length >= 1) return names;
+    const v0 = (row.variations || [])[0] || {};
+    const specs = v0.specifics || {};
+    const keys = Object.keys(specs);
+    if(keys.length) return keys.slice(0,2);
+    return ['Option'];
+  }
+
+  function applyVarNames(){
+    if(!CURRENT_VAR_ROW) return;
+    const n1 = ($('varName1').value || '').trim() || 'Option';
+    const n2 = ($('varName2').value || '').trim();
+    const newNames = n2 ? [n1, n2] : [n1];
+
+    const oldNames = VAR_OLD_NAMES && VAR_OLD_NAMES.length ? VAR_OLD_NAMES.slice(0) : _inferVarNames(CURRENT_VAR_ROW);
+
+    // Remap specifics by position (old[0]->new[0], old[1]->new[1])
+    (CURRENT_VAR_ROW.variations || []).forEach(v => {
+      v.specifics = v.specifics || {};
+      const s = v.specifics;
+      const ns = {};
+      if(oldNames[0]) ns[newNames[0]] = s[oldNames[0]] ?? s[newNames[0]] ?? '';
+      if(newNames.length > 1){
+        if(oldNames[1]) ns[newNames[1]] = s[oldNames[1]] ?? s[newNames[1]] ?? '';
+      }
+      // keep any extra keys that aren't the old name slots
+      Object.keys(s).forEach(k=>{
+        if(k === oldNames[0] || k === oldNames[1]) return;
+        if(k === newNames[0] || k === newNames[1]) return;
+        ns[k] = s[k];
+      });
+      v.specifics = ns;
+    });
+
+    CURRENT_VAR_ROW.variation_names = newNames;
+
+    // Update picture name select
+    const picSel = $('varPicName');
+    const desired = (picSel.value || '').trim();
+    if(desired && newNames.includes(desired)) CURRENT_VAR_ROW.variation_picture_name = desired;
+    else CURRENT_VAR_ROW.variation_picture_name = newNames[0];
+
+    VAR_OLD_NAMES = newNames.slice(0);
+    renderVarDlg();
+  }
+
+  function addVariation(){
+    if(!CURRENT_VAR_ROW) return;
+    const names = _inferVarNames(CURRENT_VAR_ROW);
+    const n1 = ($('varName1').value || '').trim() || names[0] || 'Option';
+    const n2 = ($('varName2').value || '').trim();
+    const specs = {};
+    specs[n1] = '';
+    if(n2) specs[n2] = '';
+    const start = (CURRENT_VAR_ROW.start_price ?? CURRENT_VAR_ROW.price ?? '');
+    const qty = (CURRENT_VAR_ROW.quantity ?? CURRENT_VAR_ROW.qty ?? 1);
+    (CURRENT_VAR_ROW.variations = CURRENT_VAR_ROW.variations || []).push({
+      sku: '',
+      // canonical keys (server expects these)
+      start_price: start,
+      quantity: qty,
+      // legacy mirrors (older editor builds)
+      price: start,
+      qty: qty,
+      specifics: specs,
+      picture_urls: []
+    });
+    renderVarDlg();
+  }
+
+  function removeVariation(idx){
+    if(!CURRENT_VAR_ROW) return;
+    const vars = CURRENT_VAR_ROW.variations || [];
+    if(idx < 0 || idx >= vars.length) return;
+    vars.splice(idx, 1);
+    renderVarDlg();
+  }
+
+  function renderVarDlg(){
+    if(!CURRENT_VAR_ROW) return;
+
+    const names = _inferVarNames(CURRENT_VAR_ROW);
+    const n1 = ($('varName1').value || '').trim() || names[0] || 'Option';
+    const n2 = ($('varName2').value || '').trim() || (names[1] || '');
+
+    $('varName1').value = n1;
+    $('varName2').value = n2;
+
+    $('thA1').textContent = n1;
+    $('thA2').textContent = n2 ? n2 : '(none)';
+
+    // Picture attribute options
+    const picSel = $('varPicName');
+    picSel.innerHTML = '';
+    const opts = [n1].concat(n2 ? [n2] : []);
+    opts.forEach(o=>{
+      const op = document.createElement('option');
+      op.value = o; op.textContent = o;
+      picSel.appendChild(op);
+    });
+    const curPic = (CURRENT_VAR_ROW.variation_picture_name || n1).trim();
+    if(opts.includes(curPic)) picSel.value = curPic;
+    else picSel.value = n1;
+
+    const tbody = $('varTbody');
+    tbody.innerHTML = '';
+
+    const vars = CURRENT_VAR_ROW.variations || [];
+    vars.forEach((v, idx) => {
+      v.specifics = v.specifics || {};
+      if(v.specifics[n1] === undefined) v.specifics[n1] = '';
+      if(n2 && v.specifics[n2] === undefined) v.specifics[n2] = '';
+
+      const tr = document.createElement('tr');
+
+      // Drag/drop reorder. eBay shows variations in the order they
+      // arrive in the AddFixedPriceItem/ReviseFixedPriceItem XML, so
+      // rearranging the array here is enough — the server's
+      // _variations_xml already preserves array order.
+      tr.draggable = true;
+      tr.dataset.varIdx = String(idx);
+      tr.style.cursor = 'grab';
+      tr.addEventListener('dragstart', (e) => {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(idx));
+        tr.style.opacity = '0.4';
+      });
+      tr.addEventListener('dragend', () => { tr.style.opacity = ''; });
+      tr.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        tr.style.borderTop = '2px solid var(--ACCENT)';
+      });
+      tr.addEventListener('dragleave', () => { tr.style.borderTop = ''; });
+      tr.addEventListener('drop', (e) => {
+        e.preventDefault();
+        tr.style.borderTop = '';
+        const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
+        const toIdx = parseInt(tr.dataset.varIdx, 10);
+        if (Number.isNaN(fromIdx) || Number.isNaN(toIdx) || fromIdx === toIdx) return;
+        const arr = CURRENT_VAR_ROW.variations || [];
+        const [moved] = arr.splice(fromIdx, 1);
+        arr.splice(toIdx, 0, moved);
+        renderVarDlg();
+      });
+
+      // Drag handle cell (visual hint — actual drag is on the whole tr)
+      const tdDrag = document.createElement('td');
+      tdDrag.textContent = '☰';
+      tdDrag.title = 'Sleep om volgorde te wijzigen';
+      tdDrag.style.cursor = 'grab';
+      tdDrag.style.color = 'var(--MUTED)';
+      tdDrag.style.userSelect = 'none';
+      tdDrag.style.padding = '0 6px';
+      tr.appendChild(tdDrag);
+
+      function tdInput(val, onChange, widthPx){
+        const td = document.createElement('td');
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.value = val ?? '';
+        if(widthPx) inp.style.width = widthPx + 'px';
+        inp.addEventListener('input', ()=>onChange(inp.value));
+        td.appendChild(inp);
+        return td;
+      }
+
+      tr.appendChild(tdInput(v.sku || '', (x)=>{ v.sku = x; }, 130));
+      tr.appendChild(tdInput(v.specifics[n1] || '', (x)=>{ v.specifics[n1] = x; }, 170));
+
+      if(n2){
+        tr.appendChild(tdInput(v.specifics[n2] || '', (x)=>{ v.specifics[n2] = x; }, 170));
+      } else {
+        const td = document.createElement('td');
+        td.textContent = '';
+        tr.appendChild(td);
+      }
+
+      const curPrice = (v.start_price ?? v.price ?? '');
+      const curQty   = (v.quantity ?? v.qty ?? '');
+      tr.appendChild(tdInput(curPrice, (x)=>{ v.start_price = x; v.price = x; }, 100));
+      tr.appendChild(tdInput(curQty,   (x)=>{ v.quantity = x;  v.qty = x;  }, 70));
+
+      // Images
+      const tdImg = document.createElement('td');
+      const btn = document.createElement('button');
+      // Make sure variations also have the legacy alias `pictures` (UI uses it in several places)
+      if ((!Array.isArray(v.pictures) || !v.pictures.length) && Array.isArray(v.picture_urls) && v.picture_urls.length){
+        v.pictures = v.picture_urls.slice(0);
+      }
+
+      const count = (v.pictures || []).length;
+      btn.textContent = `Images (${count})`;
+      btn.addEventListener('click', ()=>openImageDlg(v));
+      tdImg.appendChild(btn);
+      tr.appendChild(tdImg);
+
+      // Remove
+      const tdRm = document.createElement('td');
+      const br = document.createElement('button');
+      br.textContent = 'Remove';
+      br.className = 'red';
+      br.addEventListener('click', ()=>removeVariation(idx));
+      tdRm.appendChild(br);
+      tr.appendChild(tdRm);
+
+      tbody.appendChild(tr);
+    });
+  }
   function renderImgList(){
     const box = $('imgList'); box.innerHTML='';
     if (!CURRENT_IMG_ROW) return;
@@ -1252,21 +2026,39 @@ function conditionAllowsDescription(label, allowedList){
   });
   $('btnUpload').addEventListener('click', async () => {
     if (!CURRENT_IMG_ROW) return;
-    const f = $('imgFile').files[0]; if (!f){ alert('Kies een bestand.'); return; }
+    const f = $('imgFile').files[0];
+    if (!f) { alert('Choose File.'); return; }
+
     const fd = new FormData();
     fd.append('file', f, f.name);
     fd.append('site', SITE);
+
+    // license-header + fallback als query-param
+    const headers = {};
+    let url = '/media/eps_upload?site=' + encodeURIComponent(SITE);
+    if (LK) {
+      headers['X-License-Key'] = LK;
+      url += '&lk=' + encodeURIComponent(LK);
+    }
+
     try{
-      const r = await fetch('/media/eps_upload?site='+encodeURIComponent(SITE), { method:'POST', body:fd });
-      if (!r.ok){ const tx = await r.text(); throw new Error(tx); }
-      const js = await r.json();
-      const url = js.image_url || (js.all_urls && js.all_urls[0]);
-      if (url){
-        CURRENT_IMG_ROW.picture_urls = (CURRENT_IMG_ROW.picture_urls || []).concat([url]);
-        renderImgList(); renderBody();
+      const r = await fetch(url, { method: 'POST', body: fd, headers });
+      if (!r.ok){
+        const tx = await r.text();
+        throw new Error(tx || ('HTTP ' + r.status));
       }
-    }catch(e){ alert('Upload failed: '+(e.message||e)); }
+      const js  = await r.json();
+      const urlOut = js.image_url || (js.all_urls && js.all_urls[0]);
+      if (urlOut){
+        CURRENT_IMG_ROW.picture_urls = (CURRENT_IMG_ROW.picture_urls || []).concat([urlOut]);
+        renderImgList();
+        renderBody();
+      }
+    }catch(e){
+      alert('Upload failed: ' + (e.message || e));
+    }
   });
+
 
   // ------------------- html preview -------------------
   function openHtmlPreview(row, key){
@@ -1317,8 +2109,14 @@ function conditionAllowsDescription(label, allowedList){
     const q2 = query + (LK ? (sep + 'lk=' + encodeURIComponent(LK)) : '');
 
     status('Loading draft…');
+    showLoading('Loading draft…', 'Fetching listings from the server. Larger drafts can take a few seconds.');
     return getJSON('/web/draft' + q2)
       .then(d => {
+        SITE     = (d.site     || 'NL').toUpperCase();
+        CURRENCY = (d.currency || 'EUR').toUpperCase();
+
+        console.log('Draft site/currency:', SITE, CURRENCY);
+
         lastRows = (d.rows || []).map(r => {
           r = r || {};
           r.aspects = r.aspects || {};
@@ -1370,22 +2168,98 @@ function conditionAllowsDescription(label, allowedList){
           }
         }
 
+// Ensure all taxonomy aspect keys exist (so the editor shows ALL item-specific columns)
+try{
+  for (const r of lastRows){
+    const cat = r.category_id || null;
+    if (!cat) continue;
+    const m = ASPECT_CACHE[keyCache(cat)] || {};
+    r.aspects = r.aspects || {};
+    for (const nm in m){
+      const base = String(nm||'').trim();
+      if (!base) continue;
+      const k = base.toLowerCase().startsWith('c:') ? base : ('C:'+base);
+      if (r.aspects[k] === undefined) r.aspects[k] = '';
+    }
+  }
+}catch(_){}
+
+        try { showLoading('Rendering rows…', 'Drawing ' + lastRows.length + ' rows. Hang on for the bigger ones.'); } catch(_){}
         renderTable(lastRows);
         status('Loaded ' + lastRows.length + ' rows');
+        try { hideLoading(); } catch(_){}
 
         const bb=document.getElementById('bootBanner');
         if (bb) bb.style.display='none';
+
+        // Show EDIT MODE banner if any row has item_id (= ReviseFixedPriceItem mode)
+        try {
+          const reviseId = (lastRows || []).map(r => String(r?.item_id ?? '').trim()).find(v => v) || '';
+          const rb = document.getElementById('reviseBanner');
+          if (rb) {
+            if (reviseId) {
+              rb.textContent = `✏️ EDIT MODE — revising existing listing ${reviseId}`;
+              rb.style.display = 'inline-block';
+            } else {
+              rb.style.display = 'none';
+            }
+          }
+        } catch(_){}
       })
       .catch(e => {
         status('Error: ' + (e.message||e));
+        try { hideLoading(); } catch(_){}
         showErr('Draft laden mislukt: ' + (e.message||e));
       });
   }
 
-  function showPublishOverlay(txt){ $('pubText').textContent = txt || 'Publishing…'; $('pubOverlay').style.display='flex'; }
-  function hidePublishOverlay(){ $('pubOverlay').style.display='none'; }
+  function setPublishOverlayProgress(done, total){
+    const bar  = $('pubProg');
+    const inner = bar && bar.querySelector('.inner');
+    const lbl  = $('pubProgLabel');
+    if (!bar || !inner || !total) return;
+
+    const pct = Math.max(0, Math.min(100, Math.round((done * 100) / total)));
+    inner.style.width = pct + '%';
+    if (lbl) lbl.textContent = pct + '% completed';
+  }
+
+  function showPublishOverlay(txt){
+    $('pubText').textContent = txt || 'Publishing…';
+    const bar  = $('pubProg');
+    const inner = bar && bar.querySelector('.inner');
+    const lbl  = $('pubProgLabel');
+    if (inner) inner.style.width = '0%';
+    if (lbl) lbl.textContent = '';
+    $('pubOverlay').style.display = 'flex';
+  }
+
+  function hidePublishOverlay(){
+    $('pubOverlay').style.display = 'none';
+  }
+
 
   function publish(rows){
+    // Quick-post path: validate the inline-policy panel, then inject the
+    // fields into every row before sending to /web/publish.
+    let _qpFields = null;
+    if (_noPolicies) {
+      _qpFields = _qpValidate();
+      if (!_qpFields) {
+        try { document.getElementById('quickPostPanel').scrollIntoView({behavior:'smooth', block:'center'}); } catch(_){}
+        status('Quick post setup incomplete — fill in the highlighted fields.');
+        return;
+      }
+      // Persist for the next session so the user does not retype.
+      _qpSaveDefaults(SITE, _qpFields);
+      for (const r of (rows || [])) {
+        if (!r) continue;
+        // Don't overwrite per-row values the user may have edited.
+        for (const k in _qpFields) {
+          if (r[k] === undefined || r[k] === null || r[k] === '') r[k] = _qpFields[k];
+        }
+      }
+    }
     function _allImages(r){
       let u = [];
       if (Array.isArray(r?.picture_urls)) u = u.concat(r.picture_urls);
@@ -1454,10 +2328,30 @@ function conditionAllowsDescription(label, allowedList){
         if (o.specifics == null) o.specifics = specs;
       }
 
+// Mirror edited aspects back into item_specifics so the server publishes what you see.
+const asp2 = r.aspects;
+if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
+  if (!o.item_specifics || typeof o.item_specifics !== 'object' || Array.isArray(o.item_specifics)) o.item_specifics = {};
+  for (const k in asp2){
+    const v = asp2[k];
+    if (v == null || String(v).trim() === ''){
+      delete o.item_specifics[k];
+    } else {
+      o.item_specifics[k] = v;
+    }
+  }
+  if (o.specifics == null) o.specifics = o.item_specifics;
+}
+
       const fmt = String(r?.listing_type ?? r?.listingType ?? r?.format ?? '').toLowerCase();
       if (fmt === 'auction'){
         o.quantity = 1;
       }
+
+      // Preserve item_id so ReviseFixedPriceItem works (edit existing listing)
+      const eid = String(r?.item_id ?? r?.ItemID ?? r?.itemId ?? '').trim();
+      if (eid) o.item_id = eid;
+
       return o;
     }
 
@@ -1548,54 +2442,111 @@ function conditionAllowsDescription(label, allowedList){
       (POL.defaults && (parseInt(POL.defaults.interval_minutes,10) ||
                         parseInt((POL.defaults.schedule||{}).interval_minutes,10))) || 0;
 
-    postJSON('/web/publish', {
-      site: SITE,
-      currency: CURRENCY,
-      interval_minutes: interval,
-      timezone: clientTZ,
-      rows: rows
-    })
-  .then(res => {
-    hidePublishOverlay();
-    if (!res || res.ok !== true) {
-      status('Failed');
-      alert('Publish failed (no response).');
-      return;
-    }
-    const items = Array.isArray(res.results) ? res.results : [];
-    const okN   = items.filter(x => x && x.ok).length;
-    const fail  = items.filter(x => !x || x.ok === false);
+    // ---- batching: stuur in kleinere porties naar /web/publish ----
+    const BATCH_SIZE = 20;  // kun je later tweaken
+    const total      = rows.length;
+    let allResults   = [];
 
-    let msg = `Published: ${okN}/${items.length} OK.`;
-    if (fail.length) {
-      const lines = fail.slice(0, 5).map(x =>
-        `• ${x?.title || '(no title)'} — ${x?.error || 'unknown error'}`
-      );
-      msg += `\n\nFailures:\n${lines.join('\n')}`;
-    }
-    alert(msg);
+    (async () => {
+      try {
+        for (let i = 0; i < total; i += BATCH_SIZE) {
+          const batch      = rows.slice(i, i + BATCH_SIZE);
+          const doneAfter  = i + batch.length;
+          const batchIndex = (i / BATCH_SIZE) + 1;
 
-    // Open de juiste eBay pagina:
-    // -> alleen naar "scheduled" als ÁLLE listings gepland zijn; anders "active"
-    const allScheduled = (rows || []).length > 0 && (rows || []).every(r => !!r.schedule_time);
 
-    const tldMap = {
-      NL:'nl', BE:'be', DE:'de', FR:'fr', IT:'it', ES:'es',
-      AT:'at', CH:'ch', IE:'ie',
-      UK:'co.uk', GB:'co.uk',
-      US:'com', CA:'ca', AU:'com.au'
-    };
-    const site = (typeof SITE === 'string' ? SITE.toUpperCase() : 'US');
-    const tld  = tldMap[site] || 'com';
+          status(`Publishing ${doneAfter}/${total} rows… (batch ${batchIndex})`);
+          setPublishOverlayProgress(doneAfter, total);
 
-    const page = allScheduled ? 'scheduled' : 'active';   // <-- was 'sche'
-    const url  = `https://www.ebay.${tld}/sh/lst/${page}`;
+          const res = await postJSON('/web/publish', {
+            site: SITE,
+            currency: CURRENCY,
+            interval_minutes: interval,
+            timezone: clientTZ,
+            rows: batch
+          });
 
-    if (confirm(`Open your ${page} listings on eBay ${site}?`)) {
-      window.open(url, '_blank', 'noopener');
-    }
-      })
+          if (!res || res.ok !== true) {
+            hidePublishOverlay();
+            status('Failed');
+
+            const extra =
+              (res && (res.detail || res.error) && String(res.detail || res.error)) ||
+              'Publish failed (no response).';
+
+            alert(`Publish failed for batch ${batchIndex}.\n\n${extra}`);
+            return;
+          }
+
+          const items = Array.isArray(res.results) ? res.results : [];
+          allResults  = allResults.concat(items);
+        }
+      } catch (err) {
+        console.error(err);
+        hidePublishOverlay();
+        status('Failed');
+        alert('Publish failed (network error while talking to the server).');
+        return;
       }
+
+      // ---- alle batches klaar: zelfde resultaatlogica als voorheen ----
+      setPublishOverlayProgress(total, total);
+      hidePublishOverlay();
+
+      const items = allResults;
+      const okN   = items.filter(x => x && x.ok).length;
+      const fail  = items.filter(x => !x || x.ok === false);
+      const revised = items.filter(x => x && x.ok && x.is_revise).length;
+      const created = items.filter(x => x && x.ok && !x.is_revise).length;
+
+      // Markeer geslaagde items als gepubliceerd op de bron-rijen — zodat ze
+      // verdwijnen uit de hoofdlijst en niet per ongeluk dubbel ge-upload worden.
+      try {
+        for (let i = 0; i < items.length && i < rows.length; i++) {
+          const r   = rows[i];
+          const res = items[i];
+          if (r && res && res.ok) {
+            r._published = true;
+            if (res.item_id) r._published_item_id = res.item_id;
+          }
+        }
+        updatePublishedToggle();
+        renderBody();
+      } catch (e) { console.warn('mark published failed:', e); }
+
+      let msg = `Published: ${okN}/${items.length} OK.`;
+      if (revised > 0 && created > 0) msg += `\n(${revised} revised, ${created} created)`;
+      else if (revised > 0) msg += `\n(${revised} existing listing${revised>1?'s':''} revised ✏️)`;
+      else if (created > 0) msg += `\n(${created} new listing${created>1?'s':''} created)`;
+      if (fail.length) {
+        const lines = fail.slice(0, 5).map(x =>
+          `• ${x?.title || '(no title)'} — ${x?.error || 'unknown error'}`
+        );
+        msg += `\n\nFailures:\n${lines.join('\n')}`;
+      }
+      alert(msg);
+
+      // Open de juiste eBay pagina:
+      // -> alleen naar "scheduled" als ÁLLE listings gepland zijn; anders "active"
+      const allScheduled = (rows || []).length > 0 && (rows || []).every(r => !!r.schedule_time);
+
+      const tldMap = {
+        NL:'nl', BE:'be', DE:'de', FR:'fr', IT:'it', ES:'es',
+        AT:'at', CH:'ch', IE:'ie',
+        UK:'co.uk', GB:'co.uk',
+        US:'com', CA:'ca', AU:'com.au'
+      };
+      const site = (typeof SITE === 'string' ? SITE.toUpperCase() : 'US');
+      const tld  = tldMap[site] || 'com';
+
+      const page = allScheduled ? 'scheduled' : 'active';
+      const url  = `https://www.ebay.${tld}/sh/lst/${page}`;
+
+      if (confirm(`Open your ${page} listings on eBay ${site}?`)) {
+        window.open(url, '_blank', 'noopener');
+      }
+    })();
+}
 
   // ------------------- html editor for description -------------------
   function editHtmlSelected(){
@@ -1624,7 +2575,12 @@ function conditionAllowsDescription(label, allowedList){
       if (act === 'close'){ document.body.removeChild(dlg); }
       if (act === 'apply'){
         const v = ta.value;
-        rows.forEach(r => { r.description_html = v; });
+        rows.forEach(r => {
+          r.description_html = v;
+          // User-applied description — mark so the server sends the
+          // new content on revise (default is to skip <Description>).
+          r.description_changed = true;
+        });
         document.body.removeChild(dlg);
         renderBody();
       }
@@ -1633,14 +2589,41 @@ function conditionAllowsDescription(label, allowedList){
   document.getElementById('editHtml').addEventListener('click', editHtmlSelected);
 
   // ------------------- events (toolbar) -------------------
-  $('publishAll').addEventListener('click', () => publish(lastRows.slice()));
+  // Publish ALL: alleen rijen die nog niet gepubliceerd zijn deze sessie
+  $('publishAll').addEventListener('click', () => publish(lastRows.filter(r => !(r && r._published))));
   $('publishSel').addEventListener('click', () => publish(selectedRows()));
+
+  // Toggle voor zichtbaarheid van al gepubliceerde rijen
+  const _btnTP = document.getElementById('btnTogglePublished');
+  if (_btnTP) {
+    _btnTP.addEventListener('click', () => {
+      showPublishedRows = !showPublishedRows;
+      updatePublishedToggle();
+      renderBody();
+    });
+  }
   $('toggleHidden').checked = SHOW_HIDDEN;
   $('toggleHidden').addEventListener('change', () => { SHOW_HIDDEN = $('toggleHidden').checked; renderTable(lastRows); });
   $('checkAll').checked = true;
   $('checkAll').addEventListener('change', () => {
     const on = $('checkAll').checked;
     document.querySelectorAll('input.rowSel').forEach(cb => cb.checked = on);
+  });
+
+  // Shift-click range select on row checkboxes
+  let _lastCheckedCb = null;
+  document.addEventListener('click', e => {
+    const cb = e.target;
+    if (!cb || cb.type !== 'checkbox' || !cb.classList.contains('rowSel')) return;
+    if (e.shiftKey && _lastCheckedCb && _lastCheckedCb !== cb) {
+      const all = Array.from(document.querySelectorAll('input.rowSel'));
+      const a = all.indexOf(_lastCheckedCb), b = all.indexOf(cb);
+      if (a !== -1 && b !== -1) {
+        const lo = Math.min(a, b), hi = Math.max(a, b);
+        for (let i = lo; i <= hi; i++) all[i].checked = cb.checked;
+      }
+    }
+    _lastCheckedCb = cb;
   });
 
   // ------------------- init -------------------
@@ -1661,30 +2644,40 @@ function conditionAllowsDescription(label, allowedList){
 # =============================================================================
 
 @router.get("/web/draft")
-def web_draft(path: Optional[str] = Query(None), lk: Optional[str] = Query(None)):
+def web_draft(request: Request, path: Optional[str] = Query(None), lk: Optional[str] = Query(None)):
     """
-    Draft laden:
-      - ?lk=... zoekt uitsluitend in server/drafts/<lk>/ (nieuwste .json)
-      - zonder ?lk zoekt in server/drafts/
-      - ?path=... kan een exact bestand of een map zijn (dan nieuwste kiezen)
+    Draft laden — database-backed.
+    Falls back to filesystem for legacy drafts that haven't been migrated yet.
     """
-    chosen: Optional[str] = None
-    if path:
-        p = path.strip()
-        if os.path.isdir(p):
-            cands = sorted(glob.glob(os.path.join(p, "*.json")), key=os.path.getmtime, reverse=True)
-            chosen = cands[0] if cands else None
-        else:
-            chosen = p
-    else:
-        chosen = _latest_draft_path_for(lk)
-        if not chosen and not lk:
-            chosen = _latest_draft_path_for(None)
+    _ = path
+    lk_eff = (
+        getattr(request.state, "license_key", "")
+        or request.headers.get("X-License-Key")
+        or lk
+        or ""
+    ).strip()
 
+    bucket = _draft_bucket_for_lk(lk_eff)
+
+    # Try database first
+    from . import db as _db
+    draft = _db.draft_latest(bucket)
+    if draft:
+        try:
+            data = json.loads(draft["data"]) if isinstance(draft["data"], str) else draft["data"]
+        except Exception:
+            data = {}
+        rows = data.get("rows") or []
+        site = (data.get("site") or "NL").upper()
+        currency = (data.get("currency") or "EUR").upper()
+        return {"rows": rows, "site": site, "currency": currency, "path": draft.get("name", "db")}
+
+    # Fallback: legacy filesystem drafts
+    chosen = _latest_draft_path_for(lk_eff)
     if not chosen or not os.path.exists(chosen):
         detail = "Geen draft gevonden"
-        if lk:
-            detail += f" voor license '{lk}'"
+        if lk_eff:
+            detail += " for this license"
         raise HTTPException(status_code=404, detail=detail + ".")
 
     with open(chosen, "r", encoding="utf-8") as f:
@@ -1692,26 +2685,32 @@ def web_draft(path: Optional[str] = Query(None), lk: Optional[str] = Query(None)
     rows = data.get("rows") or []
     site = (data.get("site") or "NL").upper()
     currency = (data.get("currency") or "EUR").upper()
-    return {"rows": rows, "site": site, "currency": currency, "path": chosen}
+    return {"rows": rows, "site": site, "currency": currency, "path": os.path.basename(chosen)}
 
 @router.post("/web/draft/upload")
-def web_draft_upload(payload: Dict[str, Any]):
+def web_draft_upload(request: Request, payload: Dict[str, Any]):
     """
-    Ontvangt draft JSON van de client en schrijft dit weg in server/drafts/
-    (eventueel per license_key). Response bevat pad van het weggeschreven bestand.
+    Ontvangt draft JSON van de client en slaat op in de database.
     """
-    os.makedirs("server/drafts", exist_ok=True)
-    lk = (payload or {}).get("license_key") or ""
-    sub = os.path.join("server", "drafts", lk) if lk else os.path.join("server", "drafts")
-    os.makedirs(sub, exist_ok=True)
-    import time, json as _json
+    lk = (
+        getattr(request.state, "license_key", "")
+        or request.headers.get("X-License-Key")
+        or (payload or {}).get("license_key")
+        or ""
+    ).strip()
+    if not lk:
+        raise HTTPException(status_code=403, detail="License required")
+    bucket = _draft_bucket_for_lk(lk)
+    import time
     ts = time.strftime("%Y%m%d-%H%M%S")
-    fn = os.path.join(sub, f"draft-{ts}.json")
-    with open(fn, "w", encoding="utf-8") as f:
-        _json.dump(payload, f, ensure_ascii=False, indent=2)
-    return {"ok": True, "path": fn}
+    body = dict(payload or {})
+    body.pop("license_key", None)
 
-@router.get("/web/conditions")
+    from . import db as _db
+    draft_id = _db.draft_save(bucket=bucket, name=f"draft-{ts}", data=body)
+    return {"ok": True, "path": f"draft-{ts}", "bucket": bucket, "draft_id": draft_id}
+
+@router.get("/web/conditions_dummy")
 def web_conditions(site: str = Query("NL"), category_id: str = Query(...)):
     """
     Vereenvoudigde conditions per categorie.
