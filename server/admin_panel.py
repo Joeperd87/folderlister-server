@@ -606,9 +606,16 @@ def admin_bulk_email(req: Request, payload: dict):
     ids = payload.get("ids") or []
     subject = (payload.get("subject") or "").strip()
     body    = (payload.get("body") or "").strip()
-    html    = (payload.get("html") or None)
+    html    = (payload.get("html") or "").strip() or None
     if not ids or not subject or (not body and not html):
         raise HTTPException(400, "ids, subject en body of html vereist")
+
+    _unsub_text = "\n\n---\nYou're receiving this because you're a FolderLister user. To unsubscribe, reply with 'unsubscribe' in the subject."
+    _unsub_html = '<tr><td style="padding:12px 24px 16px 24px;border-top:1px solid #e5e7eb;"><p style="margin:0;font-size:11px;color:#9ca3af;">You\'re receiving this because you\'re a FolderLister user. To unsubscribe, <a href="mailto:support@folderlister.com?subject=unsubscribe" style="color:#9ca3af;">click here</a>.</p></td></tr>'
+    if body:
+        body = body + _unsub_text
+    if html:
+        html = html.replace("</body>", _unsub_html + "</body>") if "</body>" in html else html + _unsub_html
 
     data = _read_store()
     sent = 0; skipped = []
@@ -1335,6 +1342,28 @@ def render_admin_html_somehow():
   <button onclick="unbanIp()">Unban</button>
 </div>
 
+<!-- Email compose modal -->
+<div id="email_modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:#1a1f2e;border:1px solid #374151;border-radius:12px;padding:24px;width:700px;max-width:95vw;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:12px;">
+    <h3 style="margin:0;color:#f9fafb;">Email selected users</h3>
+    <label style="color:#9ca3af;font-size:13px;">Subject
+      <input id="em_subject" style="display:block;width:100%;margin-top:4px;box-sizing:border-box;font-size:14px;" placeholder="Subject">
+    </label>
+    <label style="color:#9ca3af;font-size:13px;">Plain text body
+      <textarea id="em_body" style="display:block;width:100%;height:200px;margin-top:4px;box-sizing:border-box;font-family:monospace;font-size:13px;resize:vertical;" placeholder="Plain text body…"></textarea>
+    </label>
+    <label style="color:#9ca3af;font-size:13px;">HTML body <span style="font-size:11px;color:#6b7280;">(optioneel — laat leeg om plain text te gebruiken)</span>
+      <textarea id="em_html" style="display:block;width:100%;height:240px;margin-top:4px;box-sizing:border-box;font-family:monospace;font-size:12px;resize:vertical;" placeholder="<p>HTML versie…</p>"></textarea>
+    </label>
+    <p style="margin:0;font-size:12px;color:#6b7280;">Een unsubscribe-link wordt automatisch toegevoegd aan elke mail.</p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;align-items:center;">
+      <small id="em_status" style="color:#ef4444;flex:1;"></small>
+      <button class="secondary" onclick="document.getElementById('email_modal').style.display='none'">Annuleren</button>
+      <button id="em_send_btn" onclick="submitBulkEmail()">Verstuur</button>
+    </div>
+  </div>
+</div>
+
 <pre id="bulk_out" class="mono" style="max-height:220px; overflow:auto; background:#0b0f14; padding:8px; border-radius:8px;"></pre>
 
     <div style="overflow:auto; max-height: 54vh; margin-top:10px;">
@@ -1562,15 +1591,15 @@ async function bulkDelete(){
 }
 
 async function bulkEmail(){
-  try{
-    const ids = selectedIds();
-    if (!ids.length) return alert('No selection');
-    const subject = prompt('Subject?'); if (!subject) return;
-    const body = prompt('Plain text body? (leave blank if you only want HTML)') || '';
-    const html = prompt('HTML body? (optional)') || '';
-    const out = await j('/admin/bulk/email','POST',{ids, subject, body, html});
-    bulk_out.textContent = JSON.stringify(out,null,2);
-  }catch(e){ alert('Bulk email failed: ' + (e && e.message ? e.message : e)); }
+  const ids = selectedIds();
+  if (!ids.length) return alert('No selection');
+  window._bulkEmailIds = ids;
+  document.getElementById('em_subject').value = '';
+  document.getElementById('em_body').value = '';
+  document.getElementById('em_html').value = '';
+  document.getElementById('em_status').textContent = '';
+  document.getElementById('email_modal').style.display = 'flex';
+  setTimeout(() => document.getElementById('em_subject').focus(), 50);
 }
 
 async function remPrev(){
@@ -1904,13 +1933,35 @@ window.detachIdentity = detachIdentity;  // globaal maken voor onclick=
   window.selectedIds = () =>
     $$('.sel:checked').map(el => el.dataset.id).filter(Boolean);
 
-  window.bulkEmail = async () => {
+  window.bulkEmail = () => {
     const ids = window.selectedIds(); if (!ids.length) return alert('No selection');
-    const subject = prompt('Subject?'); if (!subject) return;
-    const body = prompt('Plain text body? (optional)') || '';
-    const html = prompt('HTML body? (optional)') || '';
-    const out = await j('/admin/bulk/email','POST',{ids, subject, body, html});
-    const box = $('#bulk_out'); if (box) box.textContent = JSON.stringify(out,null,2);
+    window._bulkEmailIds = ids;
+    document.getElementById('em_subject').value = '';
+    document.getElementById('em_body').value = '';
+    document.getElementById('em_html').value = '';
+    document.getElementById('em_status').textContent = '';
+    document.getElementById('email_modal').style.display = 'flex';
+    setTimeout(() => document.getElementById('em_subject').focus(), 50);
+  };
+
+  window.submitBulkEmail = async () => {
+    const ids = window._bulkEmailIds || [];
+    const subject = document.getElementById('em_subject').value.trim();
+    const body    = document.getElementById('em_body').value.trim();
+    const html    = document.getElementById('em_html').value.trim();
+    const status  = document.getElementById('em_status');
+    if (!subject || (!body && !html)) { status.textContent = 'Subject en body zijn verplicht.'; return; }
+    const btn = document.getElementById('em_send_btn');
+    btn.disabled = true; btn.textContent = 'Bezig…';
+    try {
+      const out = await j('/admin/bulk/email', 'POST', {ids, subject, body, html});
+      document.getElementById('email_modal').style.display = 'none';
+      const box = $('#bulk_out'); if (box) box.textContent = JSON.stringify(out, null, 2);
+    } catch(e) {
+      status.textContent = 'Fout: ' + (e && e.message ? e.message : e);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Verstuur';
+    }
   };
   window.bulkWelcome = async () => {
     const ids = window.selectedIds(); if (!ids.length) return alert('No selection');
