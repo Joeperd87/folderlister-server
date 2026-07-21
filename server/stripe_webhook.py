@@ -35,7 +35,7 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ── Importeer jouw bestaande helpers ──────────────────────────────────────────
-from .license_store import upsert_license_plain, find_license, fingerprint
+from .license_store import upsert_license_plain, find_license, fingerprint, find_active_license_by_email
 
 log = logging.getLogger(__name__)
 
@@ -200,6 +200,36 @@ If you didn't make this purchase, please contact us immediately.
     _send_email(email, subject, text, html)
 
 
+def _send_pro_upgrade_mail(email: str, customer_name: Optional[str] = None) -> None:
+    """Stuurt een bevestiging dat de bestaande licentie is omgezet naar Pro.
+
+    Geen nieuwe key hier — de klant houdt zijn/haar bestaande, al aan eBay
+    gekoppelde licentie, dus er hoeft niets opnieuw ingevoerd te worden.
+    """
+    name_line = f"Hi {customer_name}," if customer_name else "Hi,"
+    subject = "You're on Folder Lister Pro now"
+
+    text = f"""{name_line}
+
+Thank you for subscribing to Folder Lister Pro!
+
+Good news: your existing Folder Lister license has been upgraded to Pro
+({PRO_EPS_LIMIT} image uploads / month). You don't need to enter a new
+license key or log in to eBay again — your account is already connected.
+
+If the app still shows your old plan limits, just restart Folder Lister
+so it picks up the change.
+
+Documentation: {BASE_URL}/docs
+Support: support@folderlister.com
+
+If you didn't make this purchase, please contact us immediately.
+
+— Folder Lister
+"""
+    _send_email(email, subject, text)
+
+
 def _find_license_hash_by_stripe_customer(customer_id: str) -> Optional[str]:
     """Scan the licenses table for a record whose notes-JSON references the
     given Stripe ``customer_id`` and return its ``key_hash``.
@@ -230,15 +260,23 @@ def _provision_pro_license(
     customer_name: Optional[str] = None,
 ) -> str:
     """
-    Maak een nieuwe Pro-licentie aan voor deze Stripe customer, of geef een
-    idempotente no-op als er al eentje bestaat voor hetzelfde
-    ``customer_id``. Stuurt bij creatie de key per e-mail.
+    Zet deze Stripe customer op Pro. Volgorde:
+
+      1. Idempotentie: als er al een licentie aan dit ``customer_id``
+         hangt (replay van hetzelfde webhook-event), niets opnieuw doen.
+      2. Bestaat er al een actieve licentie voor dit e-mailadres (bv. een
+         Launch-licentie die al aan een eBay-store gekoppeld is)? Upgrade
+         die dan in place naar Pro — zelfde key, zelfde eBay-koppeling.
+         Zo niet, dan zou de klant twee losse, actieve licenties krijgen
+         (de oude, gekoppelde, én een nieuwe, ongekoppelde), en zou de app
+         na het invoeren van de nieuwe key opeens 401's gaan gooien omdat
+         die nieuwe licentie nog aan geen enkele eBay-store hangt.
+      3. Alleen als er echt nog geen licentie voor dit e-mailadres bestaat,
+         maak een gloednieuwe key aan en mail die naar de klant.
 
     Retourneert de plain license key bij nieuwe aanmaak, of een lege string
-    wanneer dit een replay-event is van een al-geprovisioneerde customer
-    (we kunnen de plain key niet meer reconstrueren uit de DB, dus we
-    re-emailen niet en laten 't aan admin over om handmatig opnieuw uit
-    te geven als de klant erom vraagt).
+    bij een upgrade-in-place of een replay-event (in beide gevallen is er
+    geen nieuwe plain key om te mailen/terug te geven).
     """
     # Idempotentie: Stripe levert webhook-events at-least-once en kan ze
     # opnieuw versturen (bv. na een 500 in een eerdere afhandeling).
@@ -252,8 +290,6 @@ def _provision_pro_license(
         )
         return ""
 
-    # Nieuwe key aanmaken
-    key = secrets.token_urlsafe(24)
     notes_json = json.dumps({
         "stripe_customer_id":     customer_id,
         "stripe_subscription_id": subscription_id,
@@ -261,6 +297,33 @@ def _provision_pro_license(
         "provisioned_at":         datetime.now(timezone.utc).isoformat(),
     })
 
+    existing_license = find_active_license_by_email(email)
+    if existing_license:
+        from . import db as _db
+
+        key_hash = existing_license["key_hash"]
+        _db.license_upsert(
+            key_hash,
+            plan=PRO_PLAN_NAME,
+            expires_at=_far_future_iso(),
+            status="active",
+            notes=notes_json,
+        )
+        try:
+            _db.license_update_meta(key_hash, {"eps_daily_limit": PRO_EPS_LIMIT})
+        except Exception as e:
+            log.warning("Could not set eps_daily_limit meta on upgraded license: %s", e)
+
+        log.info(
+            "Upgraded existing license (key_hash=%s) to Pro for %s (customer %s) "
+            "— no new key issued",
+            key_hash[:24] + "...", email, customer_id,
+        )
+        _send_pro_upgrade_mail(email, customer_name)
+        return ""
+
+    # Geen bestaande licentie voor dit e-mailadres → eerste aankoop, nieuwe key.
+    key = secrets.token_urlsafe(24)
     upsert_license_plain(
         plain_key          = key,
         plan               = PRO_PLAN_NAME,

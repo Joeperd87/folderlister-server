@@ -198,6 +198,42 @@ def update_license_meta(plain_key: str, meta: dict) -> dict:
     return _row_to_rec(db.license_find(key_hash))
 
 
+def find_active_license_by_email(email: str, exclude_key_hash: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return the active license row owned by ``email``, if any.
+
+    Used on repeat/upgrade purchases so the customer's existing license can
+    be upgraded in place instead of a parallel one being minted alongside
+    it (which left customers with two active licenses under one email —
+    only one of them actually bound to their eBay store). Prefers a license
+    that already has an eBay account attached (i.e. one actually in use)
+    over a more recently created but unbound one.
+    """
+    norm = (email or "").strip().lower()
+    if not norm:
+        return None
+
+    candidates = []
+    for row in db.license_list(limit=10000):
+        if (row.get("owner_email") or "").strip().lower() != norm:
+            continue
+        if (row.get("status") or "").lower() != "active":
+            continue
+        if exclude_key_hash and row.get("key_hash") == exclude_key_hash:
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return None
+
+    for row in candidates:
+        if db.ebay_accounts_for_license(row.get("id")):
+            return row
+
+    # db.license_list() orders most-recent-first, so this is the newest
+    # active license for this email if none of them are bound yet.
+    return candidates[0]
+
+
 def attach_ebay_user(plain_key: str, ebay_user: str, max_accounts_default: int = 1) -> dict:
     key_hash = _hmac_key(plain_key)
     row = db.license_find(key_hash)

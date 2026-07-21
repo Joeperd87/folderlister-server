@@ -2780,10 +2780,6 @@ async def media_eps_upload(
             )
             resp.headers["Retry-After"] = str(retry_after)
             return resp
-        else:
-            # verbruik 1 upload voor deze call
-            from .eps_limits import increment as _eps_inc
-            _eps_inc(usage_key, 1)
         # EPS upload
     content = await file.read()
 
@@ -2798,6 +2794,16 @@ async def media_eps_upload(
         image_meta = {"error": str(_e)}
 
     urls = _eps_upload_trading(env, site, upload_name, content, picture_name)
+
+    # Charge the quota only after a confirmed successful upload — charging
+    # before this call meant a failed/timed-out attempt (auth hiccup, eBay
+    # error, dropped connection) still consumed the customer's credit, and
+    # a client-side retry after a reported "failure" would burn another
+    # one even though the first attempt may have gone through server-side.
+    if _limit is not None and urls:
+        from .eps_limits import increment as _eps_inc
+        _eps_inc(usage_key, 1)
+
     eps_limit = get_limit_for_record(rec) if rec else None
     eps_used = eps_remaining = None
     if rec:
