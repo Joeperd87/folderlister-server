@@ -5979,7 +5979,15 @@ def _normalize_email(raw: str | None) -> str:
     return f"{local}@{domain}"
 
 def _find_active_launch_by_email(email: str) -> tuple[str | None, dict | None]:
-    """Zoek een ACTIEVE launch-licentie voor dit e-mail. Retourneert (key, record) of (None, None)."""
+    """Zoek een ACTIEVE launch-licentie voor dit e-mail.
+
+    Checkt eerst de (legacy) JSON-store, en dan ook SQLite — SQLite is de
+    autoritatieve bron voor alle nieuwere activaties, maar bewaart nooit de
+    plain key (alleen de HMAC-hash). Een match die alleen in SQLite bestaat
+    krijgt dus de marker ``sqlite_only`` mee, zodat de aanroeper weet dat de
+    key niet opnieuw gemaild kan worden — en in elk geval geen tweede,
+    dubbele licentie voor hetzelfde e-mailadres aanmaakt.
+    """
     em = _normalize_email(email)
     if not em:
         return (None, None)
@@ -5990,6 +5998,14 @@ def _find_active_launch_by_email(email: str) -> tuple[str | None, dict | None]:
             and (rec.get("status") or "active") == "active"
             and owner == em):
             return (key, rec)
+
+    try:
+        from .license_store import find_active_license_by_email as _find_sql
+        row = _find_sql(em)
+        if row and (row.get("plan") or "").lower() == "launch" and (row.get("status") or "active").lower() == "active":
+            return (row["key_hash"], {**row, "sqlite_only": True})
+    except Exception:
+        pass
     return (None, None)
 
 def _assert_email_verified_if_required(email: str):
@@ -6020,6 +6036,22 @@ def license_launch_start(payload: dict = Body(...), request: Request = None):
 
     # 1) Re-use bestaande key voor dit e-mail
     existing_key, existing = _find_active_launch_by_email(email)
+    if existing_key and existing and existing.get("sqlite_only"):
+        # Al een actieve licentie, maar alleen bekend in SQLite -> de plain
+        # key is niet meer te achterhalen (nooit opgeslagen, alleen de hash).
+        # Geen nieuwe licentie aanmaken (dat zou een duplicaat voor hetzelfde
+        # e-mailadres opleveren) -- alleen melden dat er al een bestaat.
+        return {
+            "ok": True,
+            "sent_to": None,
+            "note": "existing_license_found_no_resend",
+            "detail": (
+                "An active license already exists for this email address. "
+                "We can't resend the original key automatically -- check your "
+                "inbox for the original activation email, or contact "
+                "support@folderlister.com if you can't find it."
+            ),
+        }
     if existing_key and existing:
         migrated = False
         plain = existing.get("license_key")
@@ -6479,7 +6511,10 @@ def _sell_account_get_return_policy_by_id(env: str, site: str, policy_id: str) -
 def _ai_quota_limit(plan: str) -> int:
     """Return monthly AI call limit for the given plan name."""
     plan = (plan or "").lower()
-    if "pro" in plan:
+    if "extreme" in plan:
+        default = 2_000
+        env_key = "AI_QUOTA_EXTREME"
+    elif "pro" in plan:
         default = 10_000
         env_key = "AI_QUOTA_PRO"
     elif "launch" in plan:

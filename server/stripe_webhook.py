@@ -15,6 +15,12 @@ Configuratie via .env:
   STRIPE_PRO_EPS_LIMIT     1500         (images per maand)
   PUBLIC_BASE_URL          https://folderlister.com
 
+  Extra tiers (optioneel, zelfde patroon — voeg er zoveel toe als nodig
+  door een nieuwe PlanTier() regel + bijbehorende env vars toe te voegen):
+  STRIPE_EXTREME_PRICE_ID    price_...
+  STRIPE_EXTREME_PLAN_NAME   extreme
+  STRIPE_EXTREME_EPS_LIMIT   20000
+
 Installeren:
   pip install stripe
 """
@@ -49,8 +55,38 @@ PRO_PLAN_NAME    = os.getenv("STRIPE_PRO_PLAN_NAME", "pro")
 PRO_EPS_LIMIT    = int(os.getenv("STRIPE_PRO_EPS_LIMIT", "1500"))
 BASE_URL         = os.getenv("PUBLIC_BASE_URL", "https://folderlister.com")
 
-# Hoelang een Pro-licentie geldig is na aanmaken (ruim, Stripe stuurt toch cancel-event)
+# Hoelang een licentie geldig is na aanmaken (ruim, Stripe stuurt toch cancel-event)
 PRO_EXPIRES_YEARS = 10
+
+
+class PlanTier:
+    """One Stripe-billed subscription tier: which price maps to which
+    license plan/quota. Add a new tier by adding its env vars below —
+    nothing else needs to change to support it end-to-end."""
+
+    def __init__(self, price_id: str, plan_name: str, eps_limit: int, display_name: str):
+        self.price_id = price_id
+        self.plan_name = plan_name
+        self.eps_limit = eps_limit
+        self.display_name = display_name
+
+
+PRO_TIER = PlanTier(PRO_PRICE_ID, PRO_PLAN_NAME, PRO_EPS_LIMIT, "Pro")
+
+_EXTREME_PRICE_ID = os.getenv("STRIPE_EXTREME_PRICE_ID", "")
+EXTREME_TIER = (
+    PlanTier(
+        _EXTREME_PRICE_ID,
+        os.getenv("STRIPE_EXTREME_PLAN_NAME", "extreme"),
+        int(os.getenv("STRIPE_EXTREME_EPS_LIMIT", "20000")),
+        "Extreme",
+    )
+    if _EXTREME_PRICE_ID
+    else None
+)
+
+# price_id -> PlanTier, for resolving which tier a checkout session bought.
+PLAN_TIERS_BY_PRICE: dict[str, PlanTier] = {t.price_id: t for t in (PRO_TIER, EXTREME_TIER) if t}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,20 +143,20 @@ def _send_email(to_addr: str, subject: str, body: str, html: Optional[str] = Non
         log.error("SMTP send failed to %s: %s", to_addr, e)
 
 
-def _send_pro_license_mail(email: str, key: str, customer_name: Optional[str] = None) -> None:
-    """Stuurt de Pro-licentie key naar de koper."""
+def _send_pro_license_mail(email: str, key: str, customer_name: Optional[str] = None, tier: "PlanTier" = PRO_TIER) -> None:
+    """Stuurt de licentie key naar de koper, voor welke tier dan ook."""
     name_line = f"Hi {customer_name}," if customer_name else "Hi,"
-    subject = "Your Folder Lister Pro license key"
+    subject = f"Your Folder Lister {tier.display_name} license key"
 
     text = f"""{name_line}
 
-Thank you for subscribing to Folder Lister Pro!
+Thank you for subscribing to Folder Lister {tier.display_name}!
 
 Your license key:
 
 {key}
 
-Plan: Pro — {PRO_EPS_LIMIT} image uploads per month
+Plan: {tier.display_name} — {tier.eps_limit} image uploads per month
 
 How to activate:
 1) Open the Folder Lister app.
@@ -139,7 +175,7 @@ If you didn't make this purchase, please contact us immediately.
 
     html = f"""<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Your Folder Lister Pro license</title></head>
+<head><meta charset="utf-8"><title>Your Folder Lister {tier.display_name} license</title></head>
 <body style="margin:0;padding:0;background:#f5f5f7;font-family:system-ui,-apple-system,sans-serif;">
   <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
     <tr><td align="center" style="padding:24px 12px;">
@@ -151,7 +187,7 @@ If you didn't make this purchase, please contact us immediately.
                style="display:block;margin:0 0 16px;">
           <h1 style="margin:0 0 6px;font-size:20px;color:#111;">{name_line}</h1>
           <p style="margin:0;font-size:14px;color:#555;">
-            Thank you for subscribing to <strong>Folder Lister Pro</strong>.
+            Thank you for subscribing to <strong>Folder Lister {tier.display_name}</strong>.
           </p>
         </td></tr>
 
@@ -161,7 +197,7 @@ If you didn't make this purchase, please contact us immediately.
                     display:inline-block;padding:10px 16px;border-radius:8px;
                     letter-spacing:.03em;margin:0 0 16px;">{key}</p>
           <p style="margin:0 0 4px;font-size:13px;color:#374151;">
-            Plan: <strong>Pro</strong> &mdash; {PRO_EPS_LIMIT} image uploads / month
+            Plan: <strong>{tier.display_name}</strong> &mdash; {tier.eps_limit} image uploads / month
           </p>
         </td></tr>
 
@@ -200,21 +236,21 @@ If you didn't make this purchase, please contact us immediately.
     _send_email(email, subject, text, html)
 
 
-def _send_pro_upgrade_mail(email: str, customer_name: Optional[str] = None) -> None:
-    """Stuurt een bevestiging dat de bestaande licentie is omgezet naar Pro.
+def _send_pro_upgrade_mail(email: str, customer_name: Optional[str] = None, tier: "PlanTier" = PRO_TIER) -> None:
+    """Stuurt een bevestiging dat de bestaande licentie is omgezet naar deze tier.
 
     Geen nieuwe key hier — de klant houdt zijn/haar bestaande, al aan eBay
     gekoppelde licentie, dus er hoeft niets opnieuw ingevoerd te worden.
     """
     name_line = f"Hi {customer_name}," if customer_name else "Hi,"
-    subject = "You're on Folder Lister Pro now"
+    subject = f"You're on Folder Lister {tier.display_name} now"
 
     text = f"""{name_line}
 
-Thank you for subscribing to Folder Lister Pro!
+Thank you for subscribing to Folder Lister {tier.display_name}!
 
-Good news: your existing Folder Lister license has been upgraded to Pro
-({PRO_EPS_LIMIT} image uploads / month). You don't need to enter a new
+Good news: your existing Folder Lister license has been upgraded to {tier.display_name}
+({tier.eps_limit} image uploads / month). You don't need to enter a new
 license key or log in to eBay again — your account is already connected.
 
 If the app still shows your old plan limits, just restart Folder Lister
@@ -253,14 +289,30 @@ def _find_license_hash_by_stripe_customer(customer_id: str) -> Optional[str]:
     return None
 
 
+def _resolve_tier_for_session(session_id: str) -> "PlanTier":
+    """Kijk welke prijs in deze checkout session zat en geef de bijbehorende
+    PlanTier terug. Valt terug op Pro als de line items niet op te halen
+    zijn of geen bekende prijs bevatten (oud gedrag blijft intact)."""
+    try:
+        items = stripe.checkout.Session.list_line_items(session_id, limit=10)
+        for item in items.get("data", []):
+            price_id = (item.get("price") or {}).get("id")
+            if price_id in PLAN_TIERS_BY_PRICE:
+                return PLAN_TIERS_BY_PRICE[price_id]
+    except Exception as e:
+        log.warning("Could not resolve line items for session %s: %s", session_id, e)
+    return PRO_TIER
+
+
 def _provision_pro_license(
     email: str,
     customer_id: str,
     subscription_id: str,
     customer_name: Optional[str] = None,
+    tier: "PlanTier" = PRO_TIER,
 ) -> str:
     """
-    Zet deze Stripe customer op Pro. Volgorde:
+    Zet deze Stripe customer op de gekochte tier (Pro, Extreme, ...). Volgorde:
 
       1. Idempotentie: als er al een licentie aan dit ``customer_id``
          hangt (replay van hetzelfde webhook-event), niets opnieuw doen.
@@ -293,7 +345,7 @@ def _provision_pro_license(
     notes_json = json.dumps({
         "stripe_customer_id":     customer_id,
         "stripe_subscription_id": subscription_id,
-        "stripe_price_id":        PRO_PRICE_ID,
+        "stripe_price_id":        tier.price_id,
         "provisioned_at":         datetime.now(timezone.utc).isoformat(),
     })
 
@@ -304,29 +356,29 @@ def _provision_pro_license(
         key_hash = existing_license["key_hash"]
         _db.license_upsert(
             key_hash,
-            plan=PRO_PLAN_NAME,
+            plan=tier.plan_name,
             expires_at=_far_future_iso(),
             status="active",
             notes=notes_json,
         )
         try:
-            _db.license_update_meta(key_hash, {"eps_daily_limit": PRO_EPS_LIMIT})
+            _db.license_update_meta(key_hash, {"eps_daily_limit": tier.eps_limit})
         except Exception as e:
             log.warning("Could not set eps_daily_limit meta on upgraded license: %s", e)
 
         log.info(
-            "Upgraded existing license (key_hash=%s) to Pro for %s (customer %s) "
+            "Upgraded existing license (key_hash=%s) to %s for %s (customer %s) "
             "— no new key issued",
-            key_hash[:24] + "...", email, customer_id,
+            key_hash[:24] + "...", tier.plan_name, email, customer_id,
         )
-        _send_pro_upgrade_mail(email, customer_name)
+        _send_pro_upgrade_mail(email, customer_name, tier=tier)
         return ""
 
     # Geen bestaande licentie voor dit e-mailadres → eerste aankoop, nieuwe key.
     key = secrets.token_urlsafe(24)
     upsert_license_plain(
         plain_key          = key,
-        plan               = PRO_PLAN_NAME,
+        plan               = tier.plan_name,
         expires_at_iso_utc = _far_future_iso(),
         status             = "active",
         owner_email        = email,
@@ -334,17 +386,17 @@ def _provision_pro_license(
         notes              = notes_json,
     )
 
-    # eps_daily_limit is een Pro-specifieke override; in de DB hangt 'ie
+    # eps_daily_limit is een tier-specifieke override; in de DB hangt 'ie
     # onder de meta-JSON van de licentie. update_license_meta merget 'm in
     # zonder andere meta-velden te overschrijven.
     try:
         from .license_store import update_license_meta
-        update_license_meta(key, {"eps_daily_limit": PRO_EPS_LIMIT})
+        update_license_meta(key, {"eps_daily_limit": tier.eps_limit})
     except Exception as e:
-        log.warning("Could not set eps_daily_limit meta for new pro key: %s", e)
+        log.warning("Could not set eps_daily_limit meta for new %s key: %s", tier.plan_name, e)
 
-    log.info("Pro license provisioned for %s (customer %s)", email, customer_id)
-    _send_pro_license_mail(email, key, customer_name)
+    log.info("%s license provisioned for %s (customer %s)", tier.plan_name, email, customer_id)
+    _send_pro_license_mail(email, key, customer_name, tier=tier)
     return key
 
 
@@ -423,8 +475,11 @@ async def stripe_webhook(request: Request):
             log.error("checkout.session.completed missing email or customer_id — skipping")
             return {"ok": False, "detail": "missing_email_or_customer"}
 
+        session_id = data_obj.get("id") or ""
+        tier = _resolve_tier_for_session(session_id) if session_id else PRO_TIER
+
         try:
-            _provision_pro_license(email, customer_id, subscription_id, customer_name)
+            _provision_pro_license(email, customer_id, subscription_id, customer_name, tier=tier)
         except Exception as e:
             log.error("Failed to provision Pro license for %s: %s", email, e)
             # Retourneer 200 zodat Stripe niet blijft retrien; log het probleem
@@ -451,24 +506,31 @@ async def stripe_webhook(request: Request):
 async def stripe_create_checkout(
     request:  Request,
     email:    Optional[str] = Query(None),
+    price_id: Optional[str] = Query(None, description="Stripe price ID; defaults to the Pro tier."),
 ):
     """
     Maakt een Stripe Checkout Session aan en redirect de gebruiker daarheen.
     Gebruik: <a href="/stripe/checkout?email=klant@voorbeeld.nl">Koop Pro</a>
+    Voor een andere tier: <a href="/stripe/checkout?price_id=price_...">Koop Extreme</a>
 
     Of zonder email: Stripe vraagt het zelf.
     """
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe not configured")
 
+    chosen_price = price_id or PRO_PRICE_ID
+    if chosen_price not in PLAN_TIERS_BY_PRICE:
+        raise HTTPException(status_code=400, detail="Unknown price_id")
+
     params: dict = {
         "mode":       "subscription",
-        "line_items": [{"price": PRO_PRICE_ID, "quantity": 1}],
+        "line_items": [{"price": chosen_price, "quantity": 1}],
         "success_url": f"{BASE_URL}/api/stripe/success?session_id={{CHECKOUT_SESSION_ID}}",
         "cancel_url":  f"{BASE_URL}/#pricing",
         "allow_promotion_codes": True,
-        "billing_address_collection": "auto",
-        "tax_id_collection": {"enabled": True},   # BTW-nummer voor bedrijven
+        "billing_address_collection": "required",  # nodig zodat Stripe Tax de juiste btw kan berekenen
+        "tax_id_collection": {"enabled": True},   # BTW-nummer voor bedrijven (reverse charge binnen EU)
+        "automatic_tax": {"enabled": True},       # onze prijzen zijn exclusief -- btw komt er hiermee bovenop
     }
     if email:
         params["customer_email"] = email

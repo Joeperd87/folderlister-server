@@ -2141,6 +2141,8 @@ def list_licenses(req: Request, q: Optional[str] = None) -> List[Dict[str, Any]]
     def _ai_limit_for_plan(plan: str) -> int:
         p = (plan or "").lower()
         try:
+            if "extreme" in p:
+                return int(os.getenv("AI_QUOTA_EXTREME", "2000"))
             if "pro" in p:
                 return int(os.getenv("AI_QUOTA_PRO", "10000"))
             if "launch" in p:
