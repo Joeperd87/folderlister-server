@@ -3,6 +3,7 @@
 server/.env
 *.json
 !server/requirements.txt
+!.claude/settings.json
 
 # Backups
 *.bak*
