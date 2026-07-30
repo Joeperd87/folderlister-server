@@ -3,9 +3,27 @@
 Stripe webhook handler voor Folder Lister Pro abonnementen.
 
 Afgehandelde events:
-  - checkout.session.completed      → Pro-licentie aanmaken + mail sturen
-  - customer.subscription.deleted   → Licentie op 'expired' zetten
-  - invoice.payment_failed          → (optioneel) waarschuwingsmail
+  - checkout.session.completed        → Pro-licentie aanmaken + mail sturen
+  - customer.subscription.deleted     → Licentie op 'expired' zetten
+  - customer.subscription.updated     → Licentie-plan + eps-limiet syncen naar de
+                                         huidige prijs van het abonnement (dit is wat
+                                         een downgrade daadwerkelijk doorvoert zodra
+                                         een subscription schedule compleet is)
+  - subscription_schedule.created     → Geplande downgrade: schedule-id opslaan
+  - subscription_schedule.updated     → Geplande downgrade aangepast: schedule-id bijwerken
+  - subscription_schedule.released    → Geplande downgrade geannuleerd: schedule-id wissen
+  - subscription_schedule.completed   → Downgrade is ingegaan: schedule-id wissen
+                                         (de plan-wissel zelf komt via het bijbehorende
+                                         customer.subscription.updated event hierboven)
+  - invoice.payment_failed            → (optioneel) waarschuwingsmail
+
+  Downgrades via de Customer Portal ("at end of billing period") laat Stripe zelf
+  lopen via een subscription schedule — deze integratie maakt die schedules niet
+  zelf aan, hij reageert er alleen op.
+
+  Let op: in het Stripe Dashboard (Developers → Webhooks → jouw endpoint) moeten
+  de subscription_schedule.* events en customer.subscription.updated los aangevinkt
+  staan, anders komen ze nooit binnen.
 
 Configuratie via .env:
   STRIPE_SECRET_KEY        sk_test_... of sk_live_...
@@ -400,6 +418,69 @@ def _provision_pro_license(
     return key
 
 
+def _patch_license_notes(key_hash: str, patch: dict) -> None:
+    """Merge ``patch`` into a license's notes JSON without clobbering the
+    other Stripe identifiers already stored there (customer/subscription id,
+    price id, provisioned_at, ...). A ``None`` value in ``patch`` clears
+    that key instead of writing a JSON null, so callers can e.g. remove a
+    completed/released schedule id."""
+    from . import db as _db
+    row = _db.license_find(key_hash)
+    if not row:
+        return
+    try:
+        notes = json.loads(row.get("notes") or "{}")
+    except Exception:
+        notes = {}
+    for k, v in patch.items():
+        if v is None:
+            notes.pop(k, None)
+        else:
+            notes[k] = v
+    _db.license_upsert(key_hash, notes=json.dumps(notes))
+
+
+def _record_subscription_schedule(customer_id: str, schedule_id: Optional[str], event_type: str) -> None:
+    """Store or clear the Stripe subscription_schedule id for a downgrade the
+    customer scheduled via the Customer Portal ("at end of billing period").
+    ``schedule_id=None`` clears it again (schedule released or completed)."""
+    key_hash = _find_license_hash_by_stripe_customer(customer_id)
+    if not key_hash:
+        log.warning("%s for unknown stripe_customer %s — nothing to record", event_type, customer_id)
+        return
+    _patch_license_notes(key_hash, {"stripe_subscription_schedule_id": schedule_id})
+    log.info("%s: customer %s, schedule %s", event_type, customer_id, schedule_id or "(cleared)")
+
+
+def _apply_subscription_tier(customer_id: str, subscription_id: str, price_id: Optional[str]) -> None:
+    """React to customer.subscription.updated: when the subscription's
+    current price matches a known tier, sync the license's plan + eps limit
+    to it. This is what actually applies a downgrade once its scheduled
+    subscription_schedule completes — Stripe swaps the price on the
+    subscription and fires this event alongside subscription_schedule.completed.
+    Also covers any other immediate, in-portal plan change (e.g. an upgrade
+    applied right away with proration)."""
+    tier = PLAN_TIERS_BY_PRICE.get(price_id) if price_id else None
+    if not tier:
+        log.info(
+            "customer.subscription.updated: price %s (customer %s) is not a known tier — skipping",
+            price_id, customer_id,
+        )
+        return
+    key_hash = _find_license_hash_by_stripe_customer(customer_id)
+    if not key_hash:
+        log.warning("customer.subscription.updated for unknown stripe_customer %s — no license to update", customer_id)
+        return
+    from . import db as _db
+    _db.license_upsert(key_hash, plan=tier.plan_name)
+    _db.license_update_meta(key_hash, {"eps_daily_limit": tier.eps_limit})
+    _patch_license_notes(key_hash, {"stripe_subscription_id": subscription_id, "stripe_price_id": price_id})
+    log.info(
+        "Synced license (key_hash=%s) to %s for customer %s (sub %s)",
+        key_hash[:16] + "...", tier.plan_name, customer_id, subscription_id,
+    )
+
+
 def _deactivate_pro_license(customer_id: str, subscription_id: str) -> None:
     """Zet de Pro-licentie op 'expired' wanneer Stripe het abonnement
     annuleert. No-op als geen licentie aan deze customer_id gekoppeld is."""
@@ -490,6 +571,30 @@ async def stripe_webhook(request: Request):
         customer_id     = data_obj.get("customer") or ""
         subscription_id = data_obj.get("id") or ""
         _deactivate_pro_license(customer_id, subscription_id)
+
+    # ── customer.subscription.updated ─────────────────────────────────────────
+    # Fires on every subscription change, incl. the moment a scheduled
+    # downgrade actually takes effect — sync plan/eps-limit to whatever price
+    # is current now. Harmless no-op if the price isn't a known tier.
+    elif event_type == "customer.subscription.updated":
+        customer_id     = data_obj.get("customer") or ""
+        subscription_id = data_obj.get("id") or ""
+        items           = (data_obj.get("items") or {}).get("data") or []
+        price_id        = (items[0].get("price") or {}).get("id") if items else None
+        _apply_subscription_tier(customer_id, subscription_id, price_id)
+
+    # ── subscription_schedule.* (geplande downgrade via Customer Portal) ─────
+    elif event_type in ("subscription_schedule.created", "subscription_schedule.updated"):
+        customer_id = data_obj.get("customer") or ""
+        schedule_id = data_obj.get("id") or ""
+        _record_subscription_schedule(customer_id, schedule_id, event_type)
+
+    elif event_type in ("subscription_schedule.released", "subscription_schedule.completed"):
+        # Geplande wijziging is klaar (ingegaan) of geannuleerd — schedule-id
+        # opruimen. De eventuele plan-wissel zelf komt binnen via het
+        # bijbehorende customer.subscription.updated event hierboven.
+        customer_id = data_obj.get("customer") or ""
+        _record_subscription_schedule(customer_id, None, event_type)
 
     # ── invoice.payment_failed (optioneel) ────────────────────────────────────
     elif event_type == "invoice.payment_failed":
