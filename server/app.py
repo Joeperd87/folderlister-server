@@ -6386,7 +6386,8 @@ def _as_bool(v: str | None, default=False):
     if v is None or v == "": return default
     return str(v).strip().lower() in ("1","true","yes","y","on")
 
-def _send_email(to_addr: str, subject: str, body: str, html: str | None = None) -> None:
+def _send_email(to_addr: str, subject: str, body: str, html: str | None = None,
+                 extra_headers: dict | None = None) -> None:
     import os, smtplib, ssl
     from email.message import EmailMessage
 
@@ -6402,6 +6403,8 @@ def _send_email(to_addr: str, subject: str, body: str, html: str | None = None) 
     msg["From"] = sender
     msg["To"] = to_addr
     msg["Subject"] = subject
+    for k, v in (extra_headers or {}).items():
+        msg[k] = v
     msg.set_content(body if body is not None else "")
     if html:
         try:
@@ -6434,6 +6437,69 @@ def _send_email(to_addr: str, subject: str, body: str, html: str | None = None) 
         if user and pw and "auth" in s.esmtp_features:
             s.login(user, pw)
         s.send_message(msg)
+
+_EMAIL_OPTOUTS_FILE = LICENSE_FILE.parent / "email_optouts.json"
+_EMAIL_OPTOUTS_LOCK = threading.Lock()
+
+def _load_email_optouts() -> set[str]:
+    try:
+        if _EMAIL_OPTOUTS_FILE.exists():
+            data = json.loads(_EMAIL_OPTOUTS_FILE.read_text("utf-8") or "[]")
+            if isinstance(data, list):
+                return {str(e).strip().lower() for e in data if e}
+    except Exception:
+        pass
+    return set()
+
+def is_email_opted_out(email: str) -> bool:
+    return (email or "").strip().lower() in _load_email_optouts()
+
+def add_email_optout(email: str) -> None:
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    with _EMAIL_OPTOUTS_LOCK:
+        emails = _load_email_optouts()
+        emails.add(email)
+        tmp = _EMAIL_OPTOUTS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(emails), indent=2), encoding="utf-8")
+        tmp.replace(_EMAIL_OPTOUTS_FILE)
+
+def unsubscribe_token(email: str) -> str:
+    raw = f"unsub:{(email or '').strip().lower()}"
+    return hmac.new(_LK_HMAC_SECRET, raw.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+def verify_unsubscribe_token(email: str, token: str) -> bool:
+    if not token:
+        return False
+    return hmac.compare_digest(unsubscribe_token(email), str(token))
+
+def unsubscribe_link(email: str) -> str:
+    from urllib.parse import quote
+    return f"https://folderlister.com/api/unsubscribe?email={quote((email or '').strip().lower())}&token={unsubscribe_token(email)}"
+
+@APP.get("/api/unsubscribe")
+@APP.post("/api/unsubscribe")
+@APP.get("/unsubscribe")
+@APP.post("/unsubscribe")
+def api_unsubscribe(email: str = Query(...), token: str = Query(...)):
+    from fastapi.responses import HTMLResponse
+    email = (email or "").strip().lower()
+    if not email or not verify_unsubscribe_token(email, token):
+        return HTMLResponse(
+            "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
+            "<h2>Invalid or expired unsubscribe link</h2>"
+            "<p>If you still want to stop receiving emails, contact support@folderlister.com.</p>"
+            "</body></html>",
+            status_code=400,
+        )
+    add_email_optout(email)
+    return HTMLResponse(
+        "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
+        "<h2>You've been unsubscribed</h2>"
+        f"<p>{email} will no longer receive product update emails from Folder Lister.</p>"
+        "</body></html>"
+    )
 
 @APP.post("/api/email/verify/send")
 @APP.post("/email/verify/send")

@@ -339,7 +339,8 @@ def _write_store(data: Dict[str, Any]) -> None:
     for kh, rec in data.items():
         _sync_record_to_db(kh, rec)
 
-def _admin_send_email(to: str, subject: str, body: str, html: str | None = None) -> None:
+def _admin_send_email(to: str, subject: str, body: str, html: str | None = None,
+                       extra_headers: dict | None = None) -> None:
     """Generic mailer for bulk/reminder mails, same SMTP settings as welcome mail."""
     import os, smtplib, ssl
     from email.message import EmailMessage
@@ -356,6 +357,8 @@ def _admin_send_email(to: str, subject: str, body: str, html: str | None = None)
     msg["From"] = sender
     msg["To"] = to
     msg["Subject"] = subject
+    for k, v in (extra_headers or {}).items():
+        msg[k] = v
     msg.set_content(body or "")
     if html:
         msg.add_alternative(html, subtype="html")
@@ -610,12 +613,8 @@ def admin_bulk_email(req: Request, payload: dict):
     if not ids or not subject or (not body and not html):
         raise HTTPException(400, "ids, subject en body of html vereist")
 
-    _unsub_text = "\n\n---\nYou're receiving this because you're a FolderLister user. To unsubscribe, reply with 'unsubscribe' in the subject."
-    _unsub_html = '<tr><td style="padding:12px 24px 16px 24px;border-top:1px solid #e5e7eb;"><p style="margin:0;font-size:11px;color:#9ca3af;">You\'re receiving this because you\'re a FolderLister user. To unsubscribe, <a href="mailto:support@folderlister.com?subject=unsubscribe" style="color:#9ca3af;">click here</a>.</p></td></tr>'
-    if body:
-        body = body + _unsub_text
-    if html:
-        html = html.replace("</body>", _unsub_html + "</body>") if "</body>" in html else html + _unsub_html
+    # lazy import om circular import te vermijden (zelfde patroon als _admin_send_email)
+    from .app import is_email_opted_out, unsubscribe_link
 
     data = _read_store()
     sent = 0; skipped = []
@@ -628,8 +627,40 @@ def admin_bulk_email(req: Request, payload: dict):
         to  = (rec.get("owner_email") or "").strip()
         if not to:
             skipped.append({"id": ident, "reason": "no_email"}); continue
+        if is_email_opted_out(to):
+            skipped.append({"id": ident, "reason": "unsubscribed"}); continue
+
+        # Real, per-recipient unsubscribe link (not a mailto: instruction) so it
+        # actually works, plus List-Unsubscribe headers for one-click support
+        # in Gmail/Outlook -- both matter for spam placement, not just courtesy.
+        link = unsubscribe_link(to)
+        this_body = body
+        this_html = html
+        if this_body:
+            this_body = this_body + (
+                "\n\n---\nYou're receiving this because you're a FolderLister user.\n"
+                f"Unsubscribe: {link}"
+            )
+        if this_html:
+            unsub_row = (
+                '<tr><td style="padding:12px 24px 16px 24px;border-top:1px solid #e5e7eb;">'
+                '<p style="margin:0;font-size:11px;color:#9ca3af;">'
+                "You're receiving this because you're a FolderLister user. "
+                f'<a href="{link}" style="color:#9ca3af;">Unsubscribe</a>.</p></td></tr>'
+            )
+            this_html = (
+                this_html.replace("</body>", unsub_row + "</body>")
+                if "</body>" in this_html else this_html + unsub_row
+            )
+
         try:
-            _admin_send_email(to, subject, body, html)  # gebruikt jouw SMTP settings
+            _admin_send_email(
+                to, subject, this_body, this_html,
+                extra_headers={
+                    "List-Unsubscribe": f"<{link}>",
+                    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+                },
+            )  # gebruikt jouw SMTP settings
             sent += 1
         except Exception as e:
             skipped.append({"id": ident, "reason": f"send_error:{e}"})
