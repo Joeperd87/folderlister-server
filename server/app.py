@@ -3004,7 +3004,16 @@ def web_category_variations_enabled(request: Request,
 
     r = requests.post(TRADING_ENDPOINT[env], headers=headers, data=xml.encode("utf-8"), timeout=30)
     if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
+        detail = (r.text or "").strip()
+        if not detail:
+            detail = (
+                f"Couldn't confirm whether category {category_id} ({site}) supports "
+                f"variations -- eBay's category-features check returned no details "
+                f"(HTTP {r.status_code}). This is usually temporary on eBay's side; if "
+                f"posting later fails with a 'variations not supported' error, try "
+                f"again in a few minutes."
+            )
+        raise HTTPException(status_code=r.status_code, detail=detail)
 
     ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
     root = ET.fromstring(r.content)
@@ -5334,6 +5343,32 @@ def web_publish(request: Request, payload: Dict[str, Any] = Body(...)):
             # variations only supported on fixed-price listings; keep UI consistent
             row["format"] = "Fixed price"
         row_tz = row.get("timezone") or row.get("tz") or payload_tz
+
+        # --- duplicate variation-specifics check (error 21916586 prevention) ---
+        if has_vars:
+            import json as _json
+            from collections import defaultdict as _dd
+            _spec_groups = _dd(list)
+            for _vi, _vv in enumerate(row.get("variations") or []):
+                _specs = _vv.get("specifics") or {}
+                _key = _json.dumps(_specs, sort_keys=True)
+                _spec_groups[_key].append({"index": _vi, "sku": str(_vv.get("sku") or "")})
+            _dupes = {k: v for k, v in _spec_groups.items() if len(v) > 1}
+            if _dupes:
+                _msgs = []
+                for _key, _rows in _dupes.items():
+                    _specs_display = _json.loads(_key)
+                    _row_list = ", ".join(
+                        f"row {r['index']+1} (SKU: {r['sku']})".strip() for r in _rows
+                    )
+                    _msgs.append(f"Duplicate variation specifics {_specs_display} on {_row_list}")
+                results.append({
+                    "title": row.get("title"),
+                    "ok": False,
+                    "error": "Duplicate variation specifics found — fix before publishing:\n" + "\n".join(_msgs),
+                })
+                continue
+        # --- end duplicate check ---
 
         try:
             _has_item_id = bool(str(row.get("item_id") or "").strip())

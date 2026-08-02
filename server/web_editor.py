@@ -332,6 +332,7 @@ def web_editor() -> HTMLResponse:
   <select id="bulkField"></select>
   <span id="bulkValueWrap">
     <input id="bulkValue" type="text" placeholder="value…" style="min-width:220px">
+    <input id="bulkValue2" type="text" placeholder="replace with… (leave empty to strip)" style="min-width:220px;display:none;margin-left:4px">
   </span>
   <button id="bulkApply">Apply to selected</button>
 
@@ -445,10 +446,27 @@ def web_editor() -> HTMLResponse:
         <button id="varAdd">Add variation</button>
       </div>
 
+      <!-- Bulk editor for this variation set (separate from the main-grid bulk editor) -->
+      <div style="margin-bottom:10px;padding:8px 10px;border:1px solid #222;border-radius:8px">
+        <div style="font-weight:700;margin-bottom:8px">Bulk edit (applies to all rows below)</div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <div style="display:flex;gap:8px;align-items:flex-end;padding-right:16px;border-right:1px solid #222">
+            <label>SKU<br><input id="varBulkSku" type="text" placeholder="e.g. SHELF 1-BOX 3 {n}" style="min-width:220px"></label>
+            <button id="varBulkSkuApply">Apply</button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:flex-end">
+            <label>Title — find<br><input id="varBulkFind" type="text" placeholder="find text…" style="min-width:160px"></label>
+            <label>Replace with<br><input id="varBulkReplace" type="text" placeholder="leave empty to strip" style="min-width:160px"></label>
+            <button id="varBulkReplaceApply">Apply</button>
+          </div>
+        </div>
+      </div>
+
       <div style="overflow:auto;max-height:55vh;border:1px solid #222;border-radius:12px">
         <table class="grid" style="width:100%">
           <thead>
             <tr>
+              <th style="width:24px"><input type="checkbox" id="varSelectAll" title="Select all" checked></th>
               <th style="width:28px" title="Sleep rijen om volgorde te wijzigen">&#9776;</th>
               <th style="width:140px">SKU</th>
               <th style="width:180px" id="thA1">Attr1</th>
@@ -986,6 +1004,7 @@ function conditionAllowsDescription(label, allowedList){
       {title:'', key:'_sel', type:'sel', cls:'selbox', sticky:true},
       {title:'Image', key:'_thumb', type:'thumb', cls:'thumb', sticky:true},
       {title:'Title', key:'title', type:'text', cls:'wideTitle', sortable:true},
+      {title:'SKU', key:'sku', type:'text', cls:'colCat', sortable:true},
       {title:'Category ID', key:'category_id', type:'text', cls:'colCat', sortable:true},
       {title:'Qty', key:'quantity', type:'int', cls:'colSmall', sortable:true},
       {title:'Start price', key:'price', type:'num', cls:'colPrice', sortable:true},
@@ -1589,6 +1608,77 @@ function conditionAllowsDescription(label, allowedList){
   $('varPicName').addEventListener('change', () => {
     if (CURRENT_VAR_ROW) CURRENT_VAR_ROW.variation_picture_name = $('varPicName').value;
   });
+  function _escapeRegExp(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  function selectedVarRows(){
+    if (!CURRENT_VAR_ROW) return [];
+    const vars = CURRENT_VAR_ROW.variations || [];
+    const out = [];
+    document.querySelectorAll('#varTbody input.varRowSel').forEach(cb => {
+      if (!cb.checked) return;
+      const idx = parseInt(cb.dataset.varIdx, 10);
+      if (!Number.isNaN(idx) && vars[idx]) out.push(vars[idx]);
+    });
+    return out;
+  }
+
+  // If the bulk find/replace produces the same Attr1 value on more than one
+  // row (easy to hit when stripping a shared prefix off imported titles),
+  // eBay rejects the whole listing as a duplicate variation. Disambiguate
+  // by appending " B", " C", ... to repeats instead of letting that happen silently.
+  function _disambiguateVarNames(n1Key, editedVars, allVars){
+    const seen = {};
+    allVars.forEach(v => {
+      if (editedVars.includes(v)) return;
+      const val = String((v.specifics || {})[n1Key] ?? '').trim();
+      if (val) seen[val] = (seen[val] || 0) + 1;
+    });
+    const letters = 'BCDEFGHIJKLMNOPQRSTUVWXYZ';
+    editedVars.forEach(v => {
+      v.specifics = v.specifics || {};
+      const val = String(v.specifics[n1Key] ?? '').trim();
+      if (!val) return;
+      const count = seen[val] || 0;
+      if (count > 0){
+        const letter = letters[count - 1] || ('#' + (count + 1));
+        v.specifics[n1Key] = val + ' ' + letter;
+      }
+      seen[val] = count + 1;
+    });
+  }
+
+  $('varSelectAll').addEventListener('change', () => {
+    const on = $('varSelectAll').checked;
+    document.querySelectorAll('#varTbody input.varRowSel').forEach(cb => { cb.checked = on; });
+  });
+  $('varBulkSkuApply').addEventListener('click', () => {
+    if (!CURRENT_VAR_ROW) return;
+    const tmpl = $('varBulkSku').value || '';
+    if (!tmpl){ alert('Enter a SKU template first.'); return; }
+    const vars = selectedVarRows();
+    if (!vars.length){ alert('Select at least one row first.'); return; }
+    vars.forEach((v, idx) => { v.sku = tmpl.replace(/\{n\}/g, String(idx + 1)); });
+    renderVarDlg();
+  });
+  $('varBulkReplaceApply').addEventListener('click', () => {
+    if (!CURRENT_VAR_ROW) return;
+    const find = $('varBulkFind').value || '';
+    if (!find){ alert('Enter text to find first.'); return; }
+    const repl = ($('varBulkReplace').value || '').replace(/\$/g, '$$$$');
+    const vars = selectedVarRows();
+    if (!vars.length){ alert('Select at least one row first.'); return; }
+    const re = new RegExp(_escapeRegExp(find), 'gi');
+    vars.forEach(v => {
+      v.specifics = v.specifics || {};
+      for (const k of Object.keys(v.specifics)){
+        v.specifics[k] = String(v.specifics[k] ?? '').replace(re, repl);
+      }
+    });
+    const n1Key = ($('varName1').value || '').trim() || _inferVarNames(CURRENT_VAR_ROW)[0] || 'Option';
+    const allVars = CURRENT_VAR_ROW.variations || [];
+    _disambiguateVarNames(n1Key, vars, allVars);
+    renderVarDlg();
+  });
 
   $('colClose').addEventListener('click', closeColumns);
   $('colReset').addEventListener('click', () => {
@@ -1613,7 +1703,9 @@ function conditionAllowsDescription(label, allowedList){
     sel.innerHTML = '';
 
     const base = [
-      ['title','Title'], ['category_id','Category ID'], ['quantity','Qty'], ['price','Start price'],
+      ['title','Title'], ['title_find_replace','Title — Find & Replace'],
+      ['sku_template','SKU — Template'],
+      ['category_id','Category ID'], ['quantity','Qty'], ['price','Start price'],
       ['buy_it_now_price','BIN price'], ['reserve_price','Reserve price'], ['vat_percent','VAT %'],
       ['condition_id','Condition'], ['condition_description','Condition description'],
       ['format','Format'], ['duration','Duration'],
@@ -1639,6 +1731,23 @@ function conditionAllowsDescription(label, allowedList){
 
     const field = fieldSel.value || '';
     function swap(el){ el.id='bulkValue'; current.replaceWith(el); }
+
+    const val2 = $('bulkValue2');
+    if (val2) val2.style.display = (field === 'title_find_replace') ? 'inline-block' : 'none';
+
+    if (field==='title_find_replace' || field==='sku_template'){
+      let ip = current;
+      if (ip.tagName.toLowerCase() !== 'input'){
+        ip = document.createElement('input'); ip.type='text'; ip.style.minWidth='220px';
+        swap(ip);
+      }
+      ip.value = '';
+      ip.placeholder = (field==='title_find_replace')
+        ? 'find text (e.g. shared prefix)…'
+        : 'template, use {n} for sequence, e.g. SHELF 1-BOX 3 {n}';
+      if (val2) val2.value = '';
+      return;
+    }
 
     if (field==='shipping_profile' || field==='return_profile' || field==='payment_profile' || field==='shop_id' || field==='shop_id_2'){
       let list = [];
@@ -1714,8 +1823,21 @@ function conditionAllowsDescription(label, allowedList){
     const rows = selectedRows();
     if (!rows.length){ alert('Selecteer rijen.'); return; }
 
+    let skuCounter = 0;
     for (let r of rows){
-      if (field.indexOf('aspects.') === 0){
+      if (field === 'title_find_replace'){
+        const find = valRaw || '';
+        const val2El = $('bulkValue2');
+        const repl = (val2El ? val2El.value : '').replace(/\$/g, '$$$$');
+        if (find) r.title = String(r.title || '').replace(new RegExp(_escapeRegExp(find), 'gi'), repl);
+      } else if (field === 'sku_template'){
+        // Row-level SKU only -- variation SKUs are edited separately in the
+        // Variations dialog's own bulk editor, with its own counter, so the
+        // two numbering sequences never mix.
+        const tmpl = valRaw || '';
+        skuCounter += 1;
+        r.sku = tmpl.replace(/\{n\}/g, String(skuCounter));
+      } else if (field.indexOf('aspects.') === 0){
         const k = field.slice(8); // Aspects: prefer r.aspects; fallback to item_specifics/specifics (dict only)
 let asp = r.aspects;
 if (!asp || typeof asp !== 'object' || Array.isArray(asp)) asp = null;
@@ -1935,6 +2057,16 @@ r.aspects = asp || {}; r.aspects[k] = valRaw || null;
         arr.splice(toIdx, 0, moved);
         renderVarDlg();
       });
+
+      // Selection checkbox (drives the bulk-edit box above)
+      const tdSel = document.createElement('td');
+      const cbSel = document.createElement('input');
+      cbSel.type = 'checkbox';
+      cbSel.className = 'varRowSel';
+      cbSel.dataset.varIdx = String(idx);
+      cbSel.checked = true;
+      tdSel.appendChild(cbSel);
+      tr.appendChild(tdSel);
 
       // Drag handle cell (visual hint — actual drag is on the whole tr)
       const tdDrag = document.createElement('td');
