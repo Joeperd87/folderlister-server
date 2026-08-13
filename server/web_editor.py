@@ -742,8 +742,9 @@ function postJSON(url, body){
 
   // ─── Quick-post setup (inline policies for sellers without business policies) ────────────
   // Per-site default shipping services. Must match _INLINE_SHIPPING_DEFAULTS in app.py.
-  // Shipping services come from the server (GeteBayDetails, filtered by
-  // seller country + cross-border direction). Cached in memory per site.
+  // Shipping services come from the server (GeteBayDetails for the site
+  // being listed on, domestic services only — this value goes into eBay's
+  // domestic ShippingServiceOptions). Cached in memory per site.
   // Static fallback only used if the network call fails — "Other" alone
   // is universally accepted by eBay, so it's a safe minimum.
   const QP_SHIP_FALLBACK = [['Other','Other (universal)']];
@@ -796,7 +797,14 @@ function postJSON(url, body){
     const d = _qpLoadDefaults(SITE);
     const set = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined && val !== null && val !== '') el.value = val; };
     const setChk = (id, val) => { const el = document.getElementById(id); if (el && typeof val === 'boolean') el.checked = val; };
-    set('qpShipService', d.shipping_service);
+    // Een eerder opgeslagen service kan uit de lijst verdwenen zijn (bv. een
+    // internationale token die nooit geldig was als domestic service). Dan
+    // niet toepassen, anders staat de dropdown leeg; laat 'Other' staan.
+    const sel = document.getElementById('qpShipService');
+    if (sel && d.shipping_service &&
+        Array.from(sel.options).some(o => o.value === d.shipping_service)) {
+      sel.value = d.shipping_service;
+    }
     set('qpShipCost', d.shipping_cost);
     setChk('qpFreeShip', !!d.free_shipping);
     set('qpDispatch', d.dispatch_time_max);

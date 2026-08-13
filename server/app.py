@@ -783,9 +783,27 @@ def account_site_slash():
     return account_site()
 
 def _site_from_reg_marketplace(mid: str) -> str:
-    if not mid: 
+    if not mid:
         return ""
     return _SITE_FROM_MARKETPLACE.get(mid.strip().upper(), "")
+
+def _normalize_site_code(value: str) -> str:
+    """Breng elke site-aanduiding terug tot de code die de rest van de
+    module gebruikt ('UK', 'US', 'NL', ...).
+
+    Accepteert een marketplace-id ('EBAY_GB'), de ISO-variant ('GB') of de
+    site-code zelf ('UK'). Onbekend => "" zodat de caller z'n eigen
+    fallback kan pakken. Zonder dit belandt een ruwe
+    registrationMarketplaceId in TRADING_SITE_ID.get(...) en valt die
+    stilletjes terug op site-id 0 (US)."""
+    v = (value or "").strip().upper()
+    if not v:
+        return ""
+    if v in _SITE_FROM_MARKETPLACE:      # EBAY_GB -> UK
+        return _SITE_FROM_MARKETPLACE[v]
+    if v == "GB":                        # ISO-code van de UK-site
+        return "UK"
+    return v if v in TRADING_SITE_ID else ""
 # ---------------- util store ----------------
 def _read_json(p: Path) -> Dict[str, Any]:
     if not p.exists(): return {}
@@ -3235,7 +3253,11 @@ def _fetch_shipping_service_details_cached(env: str, site: str) -> List[Dict[str
            '<DetailName>ShippingServiceDetails</DetailName>'
            '</GeteBayDetailsRequest>')
 
-    site_id = TRADING_SITE_ID.get(site.upper(), "0")
+    # Geen stille fallback op "0" (US): een onbekende site leverde eerder
+    # de Amerikaanse catalogus op zonder dat iemand dat zag.
+    site_id = TRADING_SITE_ID.get(site.upper())
+    if not site_id:
+        raise HTTPException(400, f"Unknown site {site}")
     _refresh_user_if_needed()
     u = _need_user(env)
     headers = {
@@ -3274,21 +3296,29 @@ def _fetch_shipping_service_details_cached(env: str, site: str) -> List[Dict[str
 
 @app.get("/web/shipping_services")
 def web_shipping_services(request: Request, site: Optional[str] = Query(None)):
-    """Return shipping-service tokens valid for the seller's account
-    country, filtered for the destination marketplace.
+    """Return de shipping-service tokens die geldig zijn als *domestic*
+    service op de marketplace waar de advertentie heen gaat.
 
-    ``site`` = destination marketplace (e.g. ``US``). Seller registration
-    site is derived from the OAuth user. Cross-border listings get
-    international services only; same-country listings get domestic.
+    ``site`` = doelmarketplace (bv. ``UK``). De gekozen waarde belandt in
+    ``<ShippingServiceOptions><ShippingService>`` (zie
+    ``_inline_shipping_xml``) en dat is bij eBay uitsluitend het
+    binnenlandse slot. Een internationale token daarin geeft altijd
+    fout 21916503 "is not a valid domestic Shipping Service" — dus die
+    horen hier niet in de lijst, ook niet bij cross-border.
+
+    De catalogus wordt opgehaald voor de doelsite, want eBay valideert de
+    token tegen de site waarop gelist wordt, niet tegen het land van de
+    verkoper. Bij cross-border blijft "Other" de veilige keuze: de
+    carrier-services van het doelland eisen meestal een lokaal adres.
     """
     user_id, username, env_id, reg = _identity_get_user_full()
     env = (_get_user().get("env") or env_id or "PROD").upper()
-    dest_site = (site or "").strip().upper() or (reg or "").strip().upper() or "NL"
-    seller_site = (reg or "").strip().upper() or "NL"
+    seller_site = _normalize_site_code(reg) or "NL"
+    dest_site = _normalize_site_code(site or "") or seller_site
     cross_border = (seller_site != dest_site)
 
     try:
-        services = _fetch_shipping_service_details_cached(env, seller_site)
+        services = _fetch_shipping_service_details_cached(env, dest_site)
     except HTTPException:
         services = []
 
@@ -3296,9 +3326,7 @@ def web_shipping_services(request: Request, site: Optional[str] = Query(None)):
     for s in services:
         if not s.get("valid"):
             continue
-        if cross_border and not s.get("international"):
-            continue
-        if (not cross_border) and s.get("international"):
+        if s.get("international"):
             continue
         out.append({
             "service": s["service"],
@@ -3306,11 +3334,10 @@ def web_shipping_services(request: Request, site: Optional[str] = Query(None)):
             "category": s.get("category", ""),
         })
 
-    # eBay's "Other" is always universally accepted as a fallback. Make
-    # sure it's in the list even if the catalogue skipped it for this
-    # country / direction combo.
-    if not any(x["service"] == "Other" for x in out):
-        out.insert(0, {"service": "Other", "description": "Other", "category": ""})
+    # eBay's "Other" wordt overal geaccepteerd. Zet 'm altijd bovenaan als
+    # veilige keuze, ook als de catalogus 'm ergens in het midden teruggaf.
+    out = [x for x in out if x["service"] != "Other"]
+    out.insert(0, {"service": "Other", "description": "Other", "category": ""})
 
     return {
         "seller_site": seller_site,
@@ -3475,7 +3502,11 @@ def _identity_get_user() -> tuple[str, str, str]:
         return "", "", env
 
 def _identity_get_user_full() -> tuple[str, str, str, str]:
-    """return (userId, username, env, registrationMarketplaceId, site_code)"""
+    """return (userId, username, env, site_code)
+
+    De vierde waarde is de site-code van het eBay-account ('UK', 'US',
+    'NL', ...), niet de ruwe registrationMarketplaceId ('EBAY_GB'). Alle
+    callers gebruiken hem als site-code, dus normaliseren gebeurt hier."""
     _refresh_user_if_needed()
     u = _need_user()
     env = (u.get("env") or "PROD").upper()
@@ -3491,7 +3522,7 @@ def _identity_get_user_full() -> tuple[str, str, str, str]:
             j = r.json() or {}
             user_id = (j.get("userId") or "").strip()
             username = (j.get("username") or "").strip()
-            reg = (j.get("registrationMarketplaceId") or "").strip()
+            reg = _normalize_site_code(j.get("registrationMarketplaceId") or "")
     except Exception:
         pass
     return user_id, username, env, reg
