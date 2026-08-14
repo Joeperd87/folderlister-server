@@ -4993,7 +4993,7 @@ def _build_item_xml(row: Dict[str, Any], site_code: str, currency: str, fixed: b
     # alongside ConditionID; the old ItemSpecifics "Card Condition" alone
     # is not sufficient for some niche categories).
     descriptors_xml = _build_condition_descriptors_xml(
-        row, str(row.get("category_id") or ""), site)
+        row, str(row.get("category_id") or ""), site_code)
     if descriptors_xml:
         parts.append(descriptors_xml)
 
