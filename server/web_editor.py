@@ -964,6 +964,52 @@ function postJSON(url, body){
     return null;
   }
 
+  // Bouwt de cel voor één descriptor. Staat los van de render-lus omdat hij
+  // ook opnieuw aangeroepen moet worden als de conditie op de rij verandert:
+  // Card Condition hoort bij Ungraded, Grader en Grade bij Graded.
+  function buildDescriptorControl(row, did){
+    const d = descriptorForRow(row, did);
+    if (!d){
+      const all = getConditionDescriptors(row.category_id)
+                    .filter(x => String(x.id) === String(did));
+      const needs = all.map(x => x.condition_id).filter(Boolean);
+      const span = document.createElement('span');
+      span.textContent = '-';
+      span.style.color = 'var(--MUTED)';
+      span.title = needs.length
+        ? ('Alleen van toepassing bij conditie ' + needs.join(' of ')
+           + '. Deze rij staat op ' + (conditionIdOf(row) || 'geen conditie') + '.')
+        : 'Niet van toepassing op deze rij.';
+      return span;
+    }
+    const sel = document.createElement('select');
+    sel.appendChild(new Option('', ''));
+    for (const v of (d.values || [])) sel.appendChild(new Option(v.name, v.id));
+    sel.value = (row.condition_descriptors || {})[did] || '';
+    sel.title = d.name + ' is verplicht voor deze categorie en conditie';
+    sel.addEventListener('change', () => {
+      row.condition_descriptors = row.condition_descriptors || {};
+      if (sel.value) row.condition_descriptors[did] = sel.value;
+      else delete row.condition_descriptors[did];
+    });
+    return sel;
+  }
+
+  // Na een conditiewijziging: cellen opnieuw tekenen en waarden weggooien die
+  // bij de nieuwe conditie niet meer horen. Anders stuur je een Card Condition
+  // mee op een kaart die inmiddels als graded staat.
+  function refreshDescriptorCells(rowTr, row){
+    if (!rowTr) return;
+    const stored = row.condition_descriptors || {};
+    for (const did of Object.keys(stored)){
+      if (!descriptorForRow(row, did)) delete stored[did];
+    }
+    rowTr.querySelectorAll('td[data-conddesc]').forEach(td => {
+      td.innerHTML = '';
+      td.appendChild(buildDescriptorControl(row, td.dataset.conddesc));
+    });
+  }
+
   function descriptorColumnsForRows(rows){
     const byId = {};
     for (const r of (rows || [])){
@@ -1390,6 +1436,10 @@ function conditionAllowsDescription(label, allowedList){
                   const can = conditionAllowsDescription(sel.value, allowed);
                   const input = rowTr.querySelector('textarea[data-col="condition_description"],input[data-col="condition_description"]');
                   if (input){ input.disabled = !can; if (!can) input.value=''; }
+                  // Welke ConditionDescriptors gelden, hangt af van de conditie.
+                  // Zonder dit bleef "Card Condition" een streepje nadat je de
+                  // rij op Ungraded zette.
+                  refreshDescriptorCells(rowTr, row);
                 });
               } else {
                 const vals = [
@@ -1402,6 +1452,7 @@ function conditionAllowsDescription(label, allowedList){
                 sel.addEventListener('change', () => {
                   row[col.key] = sel.value;
                   row.condition_changed = true;
+                  refreshDescriptorCells(rowTr, row);
                 });
               }
             }
@@ -1520,34 +1571,9 @@ function conditionAllowsDescription(label, allowedList){
             // We bewaren het value-ID, niet de naam, want dezelfde waarde
             // heeft per categorie en marketplace een ander ID.
             const did = col.key.slice(9);
-            const d = descriptorForRow(row, did);
-            if (!d){
-              // Geldt niet bij de conditie die op deze rij staat. Card
-              // Condition hoort bij Ungraded, Grader en Grade bij Graded.
-              // Zeg dat er dan bij: een kaal streepje laat de verkoper raden.
-              const all = getConditionDescriptors(row.category_id)
-                            .filter(x => String(x.id) === String(did));
-              const needs = all.map(x => x.condition_id).filter(Boolean);
-              const span = document.createElement('span');
-              span.textContent = '-';
-              span.style.color = 'var(--MUTED)';
-              span.title = needs.length
-                ? ('Alleen van toepassing bij conditie ' + needs.join(' of ')
-                   + '. Deze rij staat op ' + (conditionIdOf(row) || 'geen conditie') + '.')
-                : 'Niet van toepassing op deze rij.';
-              put(span); return;
-            }
-            const sel = document.createElement('select');
-            sel.appendChild(new Option('', ''));
-            for (const v of (d.values || [])) sel.appendChild(new Option(v.name, v.id));
-            sel.value = (row.condition_descriptors || {})[did] || '';
-            sel.title = d.name + ' is verplicht voor deze categorie en conditie';
-            sel.addEventListener('change', () => {
-              row.condition_descriptors = row.condition_descriptors || {};
-              if (sel.value) row.condition_descriptors[did] = sel.value;
-              else delete row.condition_descriptors[did];
-            });
-            put(sel); return;
+            cell.dataset.conddesc = did;
+            put(buildDescriptorControl(row, did));
+            return;
           }
 
           if (col.type === 'conddesc'){
@@ -1960,6 +1986,15 @@ r.aspects = asp || {}; r.aspects[k] = valRaw || null;
         r[field] = (String(valRaw).toLowerCase() === 'true');
       } else {
         r[field] = valRaw || '';
+      }
+      // Conditie in bulk gewijzigd? Gooi descriptorwaarden weg die bij de
+      // nieuwe conditie niet meer horen. renderBody() hieronder tekent de
+      // cellen opnieuw, maar ruimt de opgeslagen waarden niet op.
+      if (field === 'condition_id'){
+        const stored = r.condition_descriptors || {};
+        for (const did of Object.keys(stored)){
+          if (!descriptorForRow(r, did)) delete stored[did];
+        }
       }
     }
     renderBody();
