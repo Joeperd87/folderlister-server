@@ -762,16 +762,38 @@ def oauth_status_slash():
 
 @app.get("/oauth/clear")
 @app.get("/oauth/clear/")
-def oauth_clear():
-    """Wis het opgeslagen user-token zodat de volgende poll 'not authenticated' ziet.
-    Gebruik dit vóór een force-login om te voorkomen dat de oude sessie direct terugkomt."""
-    tk = _tokens()
-    tk.pop("user", None)
-    # verwijder ook context-specifieke user-tokens
-    for key in [k for k in tk if k not in ("app_PROD", "app_SANDBOX")]:
-        tk.pop(key, None)
-    _save_tokens(tk)
-    return {"ok": True}
+def oauth_clear(request: Request):
+    """Wis het opgeslagen user-token van DEZE licentie, zodat een force-login
+    daarna niet meteen de oude sessie terugziet.
+
+    De vorige versie deed niets. Hij haalde sleutels uit een gereconstrueerd
+    dict en vertrouwde op _save_tokens om ze weg te schrijven, maar die doet
+    uitsluitend upserts en verwijdert nooit. Het token bleef dus staan,
+    /account/whoami antwoordde direct weer met de vorige gebruiker, en de
+    client zag een account-wissel daardoor pas bij de volgende poging.
+
+    Strikt begrensd tot de eigen licentie: de oude lus liep over alle
+    sleutels, en die letterlijk laten wissen zou het token van iedere klant
+    weggooien.
+    """
+    lk = ((request.headers.get("X-License-Key") or request.cookies.get("license_key"))
+          or request.query_params.get("lk") or "").strip()
+    if not lk:
+        raise HTTPException(401, "License key required")
+
+    removed = 0
+    for row in _db.token_list():
+        ctx = str(row.get("context") or "")
+        if not ctx.startswith("ctx_"):
+            continue
+        if ctx[4:].split(":", 1)[0] != lk:
+            continue
+        try:
+            _db.token_delete(ctx)
+            removed += 1
+        except Exception:
+            pass
+    return {"ok": True, "cleared": removed}
 
 # --- Account helpers: idem ---
 @app.get("/account/whoami/")
