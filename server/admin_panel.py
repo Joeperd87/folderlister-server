@@ -2574,3 +2574,178 @@ def admin_cleanup_empty(req: Request):
     _write_store(data)
     return {"ok": True, "removed": before - len(data), "left": len(data)}
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI TRAININGSDATA — voorstel versus gepubliceerd
+# ─────────────────────────────────────────────────────────────────────────────
+# Koppelt de ai_analysis-logregels (wat de AI voorstelde) aan de ai_published-
+# regels (wat de verkoper daadwerkelijk publiceerde) op analysis_id. Dat paar
+# is het enige dat vertelt of een suggestie deugde.
+
+def _ai_training_pairs(limit: int = 500) -> Dict[str, Any]:
+    """Bouw (voorstel, uitkomst)-paren uit de request_log."""
+    from . import db as _db
+    proposals = _db.log_query("ai_analysis", limit=limit)
+    published = _db.log_query("ai_published", limit=limit)
+
+    def _meta(row) -> Dict[str, Any]:
+        m = row.get("meta")
+        if isinstance(m, str):
+            try:
+                return json.loads(m or "{}")
+            except Exception:
+                return {}
+        return m or {}
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for r in published:
+        m = _meta(r)
+        aid = str(m.get("analysis_id") or "")
+        if aid:
+            by_id[aid] = {"meta": m, "ts": r.get("ts"), "outcome": r.get("endpoint") or ""}
+
+    pairs: List[Dict[str, Any]] = []
+    n_matched = n_title_kept = n_title_changed = n_cond_kept = 0
+    for r in proposals:
+        m = _meta(r)
+        aid = str(m.get("analysis_id") or "")
+        inputs = m.get("inputs") or {}
+        output = m.get("output") or {}
+        hit = by_id.get(aid)
+
+        ai_title = str(output.get("title_suggestion") or "")
+        final_title = ""
+        final_cond = ""
+        ai_cond = str(output.get("condition_suggestion") or "")
+        if hit:
+            n_matched += 1
+            final = (hit["meta"].get("final") or {})
+            final_title = str(final.get("title") or "")
+            final_cond = str(final.get("condition_id") or "")
+            if ai_title and final_title:
+                if ai_title.strip() == final_title.strip():
+                    n_title_kept += 1
+                else:
+                    n_title_changed += 1
+            if ai_cond and final_cond and ai_cond.strip() == final_cond.strip():
+                n_cond_kept += 1
+
+        pairs.append({
+            "analysis_id": aid,
+            "ts": r.get("ts"),
+            "user": (r.get("license_fp") or "")[:12],
+            "kind": r.get("endpoint") or "",
+            "site": str(inputs.get("target_site") or ""),
+            "category": str(inputs.get("category_name") or inputs.get("category_id") or ""),
+            "ai_title": ai_title,
+            "final_title": final_title,
+            "ai_condition": ai_cond,
+            "final_condition": final_cond,
+            "n_facts": len(output.get("facts") or output.get("specifics") or []),
+            "published": bool(hit),
+            "outcome": (hit or {}).get("outcome", ""),
+        })
+
+    return {
+        "pairs": pairs,
+        "stats": {
+            "n_proposals": len(proposals),
+            "n_published": len(published),
+            "n_matched": n_matched,
+            "n_title_kept": n_title_kept,
+            "n_title_changed": n_title_changed,
+            "n_cond_kept": n_cond_kept,
+        },
+    }
+
+
+@router.get("/ai/training.json")
+def admin_ai_training_json(req: Request, limit: int = 500):
+    _require_admin(req)
+    return _ai_training_pairs(limit=limit)
+
+
+@router.get("/ai/training")
+def admin_ai_training_page(req: Request, limit: int = 200):
+    _require_admin(req)
+    data = _ai_training_pairs(limit=limit)
+    st = data["stats"]
+
+    def esc(v) -> str:
+        return (str(v or "")
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    def fmt_ts(ts) -> str:
+        try:
+            return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%d-%m %H:%M")
+        except Exception:
+            return ""
+
+    matched = st["n_matched"]
+    kept_pct = round(100.0 * st["n_title_kept"] / matched, 1) if matched else 0.0
+
+    rows_html = []
+    for p in data["pairs"]:
+        if p["published"]:
+            same = p["ai_title"].strip() == p["final_title"].strip() and p["ai_title"].strip() != ""
+            badge = ('<span class="ok">overgenomen</span>' if same
+                     else '<span class="chg">aangepast</span>')
+            final_cell = esc(p["final_title"]) or "<span class=muted>(leeg)</span>"
+        else:
+            badge = '<span class="muted">niet gepubliceerd</span>'
+            final_cell = "<span class=muted>-</span>"
+        rows_html.append(
+            "<tr>"
+            f"<td class=muted>{fmt_ts(p['ts'])}</td>"
+            f"<td class=mono>{esc(p['user'])}</td>"
+            f"<td>{esc(p['kind'])}</td>"
+            f"<td>{esc(p['site'])}</td>"
+            f"<td>{esc(p['category'])}</td>"
+            f"<td>{esc(p['ai_title'])}</td>"
+            f"<td>{final_cell}</td>"
+            f"<td>{badge}</td>"
+            "</tr>"
+        )
+
+    html = f"""<!doctype html><meta charset="utf-8">
+<title>AI trainingsdata</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<style>
+  body{{font-family:system-ui,Segoe UI,Inter,Arial,sans-serif;background:#0b0f14;color:#e8eef5;margin:0;padding:24px}}
+  h1{{font-size:1.3rem;margin:0 0 4px}}
+  .muted{{color:#9fb0c3}}
+  .cards{{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0 22px}}
+  .card{{background:#121822;border:1px solid #1b2433;border-radius:12px;padding:14px 18px;min-width:150px}}
+  .card .n{{font-size:1.6rem;font-weight:700}}
+  .card .l{{color:#9fb0c3;font-size:.85rem}}
+  .wrap{{overflow-x:auto;border:1px solid #1b2433;border-radius:12px}}
+  table{{border-collapse:collapse;width:100%;font-size:.9rem;min-width:900px}}
+  th,td{{text-align:left;padding:8px 12px;border-bottom:1px solid #1b2433;vertical-align:top}}
+  th{{background:#0f1520;color:#9fb0c3;font-weight:600;position:sticky;top:0}}
+  .mono{{font-family:ui-monospace,Consolas,monospace;font-size:.8rem}}
+  .ok{{color:#4ade80}} .chg{{color:#fbbf24}}
+  a{{color:#148CA0}}
+</style>
+<h1>AI trainingsdata</h1>
+<div class="muted">Wat de AI voorstelde, naast wat de verkoper publiceerde. Laatste {limit} analyses.</div>
+<div class="cards">
+  <div class="card"><div class="n">{st['n_proposals']}</div><div class="l">AI-analyses</div></div>
+  <div class="card"><div class="n">{matched}</div><div class="l">gekoppeld aan publicatie</div></div>
+  <div class="card"><div class="n">{st['n_title_kept']}</div><div class="l">titel overgenomen</div></div>
+  <div class="card"><div class="n">{st['n_title_changed']}</div><div class="l">titel aangepast</div></div>
+  <div class="card"><div class="n">{kept_pct}%</div><div class="l">titel ongewijzigd</div></div>
+</div>
+<div class="wrap">
+<table>
+  <tr><th>Wanneer</th><th>Gebruiker</th><th>Route</th><th>Site</th><th>Categorie</th>
+      <th>AI-voorstel titel</th><th>Gepubliceerde titel</th><th></th></tr>
+  {''.join(rows_html) or '<tr><td colspan=8 class=muted>Nog geen data. Zodra er een AI-analyse gedraaid wordt, verschijnt hij hier.</td></tr>'}
+</table>
+</div>
+<p class="muted" style="margin-top:16px">
+  Ruwe data: <a href="/api/admin/ai/training.json?limit={limit}">training.json</a>
+</p>
+"""
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+

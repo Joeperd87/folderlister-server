@@ -925,6 +925,59 @@ function postJSON(url, body){
     const m = ASPECT_CACHE[keyCache(cat)] || {};
     return m[taxonomyName] || [];
   }
+
+  // ─── ConditionDescriptors (bv. Card Condition, Grader, Coin Condition) ────
+  // eBay eist deze bij bepaalde categorieen naast de gewone conditie. Ze zijn
+  // GEEN item specifics: alles in row.aspects gaat mee als <ItemSpecifics> en
+  // wordt daar geweigerd. We schrijven naar row.condition_descriptors, als
+  // {descriptor_id: value_id}. De ID's komen rechtstreeks van eBay, want
+  // dezelfde waarde heeft per categorie en per marketplace een ander ID.
+  const COND_DESC_CACHE = {};   // site|categorie -> [descriptor, ...]
+
+  function ensureConditionDescriptorsFor(categoryId){
+    if (!categoryId) return Promise.resolve();
+    const k = keyCache(categoryId);
+    if (COND_DESC_CACHE[k]) return Promise.resolve();
+    const url = '/web/condition_descriptors?site=' + encodeURIComponent(SITE)
+              + '&category_id=' + encodeURIComponent(categoryId);
+    return getJSON(url)
+      .then(js => { COND_DESC_CACHE[k] = (js && Array.isArray(js.descriptors)) ? js.descriptors : []; })
+      .catch(() => { COND_DESC_CACHE[k] = []; });
+  }
+
+  function getConditionDescriptors(cat){ return COND_DESC_CACHE[keyCache(cat)] || []; }
+
+  // Alleen het conditie-ID uit "4000-Ungraded" of "4000".
+  function conditionIdOf(row){
+    const m = String(row && (row.condition_id || row.condition) || '').match(/\d+/);
+    return m ? m[0] : '';
+  }
+
+  // De descriptor die bij deze rij hoort: juiste categorie en juiste conditie.
+  function descriptorForRow(row, descriptorId){
+    const cid = conditionIdOf(row);
+    for (const d of getConditionDescriptors(row.category_id)){
+      if (String(d.id) !== String(descriptorId)) continue;
+      if (d.condition_id && cid && String(d.condition_id) !== cid) continue;
+      return d;
+    }
+    return null;
+  }
+
+  function descriptorColumnsForRows(rows){
+    const byId = {};
+    for (const r of (rows || [])){
+      for (const d of getConditionDescriptors(r.category_id)){
+        if (!d.required) continue;                      // optionele overslaan
+        if (String(d.mode || '') === 'FREE_TEXT') continue;  // geen keuzelijst
+        byId[String(d.id)] = d.name || String(d.id);
+      }
+    }
+    return Object.keys(byId).sort().map(id => ({
+      title: byId[id], key: 'conddesc.' + id, type: 'descriptor',
+      cls: 'colAspect', sortable: false
+    }));
+  }
   // === add below getConditionList ===
 
 // Normalizes any incoming condition value to a valid UI label from `allowedList`.
@@ -978,7 +1031,9 @@ function conditionAllowsDescription(label, allowedList){
   function ensureAspectsAndConditionsMany(cats){
     const uniq = {}; (cats||[]).forEach(c => { if (c) uniq[c]=1; });
     const list = Object.keys(uniq);
-    return Promise.all(list.map(cid => Promise.all([ ensureAspectsFor(cid), ensureConditionsFor(cid) ])));
+    return Promise.all(list.map(cid => Promise.all([
+      ensureAspectsFor(cid), ensureConditionsFor(cid), ensureConditionDescriptorsFor(cid)
+    ])));
   }
 
   function getConditionList(cat){
@@ -1026,6 +1081,7 @@ function conditionAllowsDescription(label, allowedList){
     for (const k of aspectKeys){
       cols.push({title:k, key:'aspects.'+k, type:'aspect', cls:'colAspect', sortable:true});
     }
+    for (const c of descriptorColumnsForRows(rows)) cols.push(c);
     return cols;
   }
 
@@ -1112,7 +1168,7 @@ function conditionAllowsDescription(label, allowedList){
     }
     return Object.keys(seen).sort().map(k => ({
       title: k, key: 'aspects.'+k, type:'aspect', cls:'colAspect', sortable:true
-    }));
+    })).concat(descriptorColumnsForRows(rowsForCat));
   }
 
   function renderSingleModeTables(rows, grid){
@@ -1456,6 +1512,34 @@ function conditionAllowsDescription(label, allowedList){
               put(tx);
             }
             return;
+          }
+
+          if (col.type === 'descriptor'){
+            // eBay's ConditionDescriptors. Bewust NIET in row.aspects: alles
+            // daar gaat mee als <ItemSpecifics> en wordt daar geweigerd.
+            // We bewaren het value-ID, niet de naam, want dezelfde waarde
+            // heeft per categorie en marketplace een ander ID.
+            const did = col.key.slice(9);
+            const d = descriptorForRow(row, did);
+            if (!d){
+              // Geldt niet voor deze rij, bijvoorbeeld Card Condition bij een
+              // graded kaart. Leeg laten in plaats van een misleidend veld.
+              const span = document.createElement('span');
+              span.textContent = '-';
+              span.style.color = 'var(--MUTED)';
+              put(span); return;
+            }
+            const sel = document.createElement('select');
+            sel.appendChild(new Option('', ''));
+            for (const v of (d.values || [])) sel.appendChild(new Option(v.name, v.id));
+            sel.value = (row.condition_descriptors || {})[did] || '';
+            sel.title = d.name + ' is verplicht voor deze categorie en conditie';
+            sel.addEventListener('change', () => {
+              row.condition_descriptors = row.condition_descriptors || {};
+              if (sel.value) row.condition_descriptors[did] = sel.value;
+              else delete row.condition_descriptors[did];
+            });
+            put(sel); return;
           }
 
           if (col.type === 'conddesc'){

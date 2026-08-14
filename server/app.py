@@ -3733,61 +3733,145 @@ _ASPECTS_NORM_CACHE_TTL = 6 * 3600  # 6 hours
 # lowercase lookup, then emit the descriptor XML alongside ConditionID.
 
 # value-name (lowercase) -> Trading API value-ID, per descriptor name-ID
-_CONDITION_DESCRIPTOR_VALUE_IDS: Dict[str, Dict[str, str]] = {
-    # 40001 = Card Condition (Ungraded trading cards)
-    "40001": {
-        "near mint or better": "400010",
-        "excellent":            "400011",
-        "very good":            "400012",
-        "poor":                 "400013",
-    },
-}
-
-# category_id -> { condition_id : { aspect_name (lowercase) : descriptor name-ID } }
-# Descriptor 40001 is only valid for ConditionID 4000 (Ungraded). For
-# ConditionID 2750 (Graded) eBay expects 27501 (Professional Grader) +
-# 27502 (Grade) — but we don't yet have a value-ID mapping for those, so
-# the Graded path is left empty for now and users get a fallback to the
-# old non-descriptor behaviour for that condition.
-_CATEGORY_DESCRIPTOR_MAP: Dict[str, Dict[str, Dict[str, str]]] = {
-    "261328": {  # Sports Trading Card Singles
-        "4000": {"card condition": "40001"},
-    },
-    "212": {  # Trading Card Singles
-        "4000": {"card condition": "40001"},
-    },
-    "183454": {  # alt cat id
-        "4000": {"card condition": "40001"},
-    },
-}
+# Hier stonden twee vaste tabellen: welke categorie een descriptor eist, en
+# welke waarde-naam bij welk value-ID hoort. Allebei weg, want ze konden niet
+# kloppen. Gemeten op 14-08-2026 tegen de live metadata:
+#   - 183454 heeft andere value-ID's dan 261328 (400015-400017 vs 400011-400013)
+#   - categorie 37566 verschilt zelfs per marketplace: UK gebruikt de ene reeks,
+#     US de andere
+#   - 183050 ontbrak in de tabel terwijl eBay er wel een descriptor eist
+#   - 212 stond erin maar komt in de lijst van eBay niet voor
+#   - graded kaarten (2750) waren onmogelijk, want de Grader- en Grade-waarden
+#     stonden nergens
+#   - op de Amerikaanse marketplace eisen 273 categorieen een descriptor,
+#     waarvan 262 muntcategorieen die hier volledig ontbraken
+# Alles komt nu per categorie van eBay zelf.
+# Waarom live: de waarde-ID's verschillen per categorie én per marketplace.
+# Categorie 37566 gebruikt op UK de reeks 400011-400013 en op US 400015-400017,
+# en 183454 wijkt op beide af van 261328. Een vaste tabel kan dus niet kloppen.
+# Op UK eisen 4 categorieen een descriptor, op US 273 (waarvan 262 munten).
+_COND_DESCRIPTORS_CACHE: Dict[str, Dict[str, Any]] = {}
+_COND_DESCRIPTORS_TTL = 6 * 3600
 
 
-def _build_condition_descriptors_xml(row: Dict[str, Any], category_id: str) -> str:
-    """Build the <ConditionDescriptors> XML block for categories that need
-    structured condition aspects (trading cards etc.). Returns empty
-    string if the category/condition combo doesn't need descriptors or
-    values can't be resolved."""
-    cat = str(category_id or "").strip()
-    cat_map = _CATEGORY_DESCRIPTOR_MAP.get(cat)
-    if not cat_map:
+def _fetch_condition_descriptors(site: str, category_id: str) -> List[Dict[str, Any]]:
+    """Haal de ConditionDescriptors voor een categorie op via Sell Metadata.
+
+    Dezelfde call die _taxonomy_conditions al doet; die leest alleen de
+    conditiewaarden uit en negeert het descriptor-deel."""
+    import time as _t
+    key = f"{(site or '').upper()}|{category_id}"
+    hit = _COND_DESCRIPTORS_CACHE.get(key)
+    if hit and (_t.time() - hit.get("_ts", 0)) < _COND_DESCRIPTORS_TTL:
+        return hit["data"]
+
+    marketplace = MARKETPLACE_ID.get((site or "").upper())
+    if not marketplace:
+        raise HTTPException(400, f"Unknown site {site}")
+    env = (_get_user().get("env") or "PROD")
+    path = f"/sell/metadata/v1/marketplace/{marketplace}/get_item_condition_policies"
+    r = _commerce_get(env, path, {"filter": "categoryIds:{" + str(category_id) + "}"})
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text[:300])
+
+    out: List[Dict[str, Any]] = []
+    for pol in (r.json() or {}).get("itemConditionPolicies") or []:
+        # De filter wordt door eBay soms genegeerd; pak alleen onze categorie.
+        if str(pol.get("categoryId") or "") != str(category_id):
+            continue
+        for cond in pol.get("itemConditions") or []:
+            for d in cond.get("conditionDescriptors") or []:
+                con = d.get("conditionDescriptorConstraint") or {}
+                out.append({
+                    "condition_id": str(cond.get("conditionId") or ""),
+                    "id": str(d.get("conditionDescriptorId") or ""),
+                    "name": str(d.get("conditionDescriptorName") or ""),
+                    "required": (str(con.get("usage") or "").upper() == "REQUIRED"),
+                    "mode": str(con.get("mode") or ""),
+                    "values": [
+                        {"id": str(v.get("conditionDescriptorValueId") or ""),
+                         "name": str(v.get("conditionDescriptorValueName") or "")}
+                        for v in (d.get("conditionDescriptorValues") or [])
+                    ],
+                })
+
+    _COND_DESCRIPTORS_CACHE[key] = {"_ts": _t.time(), "data": out}
+    return out
+
+
+@app.get("/web/condition_descriptors")
+def web_condition_descriptors(request: Request,
+                              site: str = Query(None),
+                              category_id: str = Query(...)):
+    """Welke ConditionDescriptors eist eBay voor deze categorie?
+
+    De web editor gebruikt dit om per rij een kolom te tonen voor elk verplicht
+    descriptorveld. Zonder die kolom kon de verkoper de waarde nergens invullen
+    en faalde publiceren op "Card Condition (40001) is a required field".
+
+    De verkoper kiest een naam, de editor bewaart het bijbehorende value-ID.
+    Zo hoeft er nergens een naam terug naar een ID vertaald te worden.
+    """
+    site, _ = _effective_site_and_currency(site, None)
+    try:
+        descriptors = _fetch_condition_descriptors(site, category_id)
+    except HTTPException:
+        descriptors = []
+    return {"site": site, "category_id": str(category_id), "descriptors": descriptors}
+
+
+def _build_condition_descriptors_xml(row: Dict[str, Any], category_id: str,
+                                     site: str = "") -> str:
+    """Bouw het <ConditionDescriptors>-blok voor categorieen die dat eisen.
+
+    De web editor levert per rij ``condition_descriptors`` aan als
+    ``{descriptor_id: value_id}``, met ID's die rechtstreeks van eBay komen.
+    Er wordt hier dus niets meer van naam naar ID vertaald: dat ging mis omdat
+    dezelfde waarde per categorie en per marketplace een ander ID heeft.
+
+    Oudere drafts droegen de waarde als naam mee in de item specifics. Die
+    worden nog omgezet, maar via de live metadata en niet via een vaste tabel.
+    """
+    pairs: List[tuple[str, str]] = []
+
+    own = row.get("condition_descriptors")
+    if isinstance(own, str):
+        try:
+            own = json.loads(own)
+        except Exception:
+            own = None
+    if isinstance(own, dict):
+        for k, v in own.items():
+            name_id = re.sub(r"\D", "", str(k or ""))
+            value_id = re.sub(r"\D", "", str(v or ""))
+            if name_id and value_id:
+                pairs.append((name_id, value_id))
+
+    if not pairs:
+        pairs = _legacy_descriptor_pairs_from_aspects(row, category_id, site)
+
+    if not pairs:
         return ""
+    body = "".join(
+        f"<ConditionDescriptor><Name>{n}</Name><Value>{v}</Value></ConditionDescriptor>"
+        for n, v in pairs
+    )
+    return "<ConditionDescriptors>" + body + "</ConditionDescriptors>"
 
-    # Resolve current condition_id from the row (digits only).
-    cond_raw = str(row.get("condition_id") or row.get("ConditionID") or "").strip()
-    m = re.search(r"\d+", cond_raw)
-    cond_id = m.group(0) if m else ""
-    asp_to_desc = cat_map.get(cond_id)
-    if not asp_to_desc:
-        return ""
 
+def _legacy_descriptor_pairs_from_aspects(row: Dict[str, Any], category_id: str,
+                                          site: str) -> List[tuple[str, str]]:
+    """Terugval voor drafts van voor de live-descriptors: de waarde staat daar
+    als naam in de item specifics ("Card Condition" -> "Poor"). Zoek naam en
+    waarde op in de metadata van eBay zelf."""
     specs = row.get("item_specifics") or row.get("aspects") or {}
     if isinstance(specs, str):
         try:
             specs = json.loads(specs)
         except Exception:
-            specs = {}
+            return []
     if isinstance(specs, list):
-        specs_dict: Dict[str, Any] = {}
+        flat: Dict[str, Any] = {}
         for nv in specs:
             if isinstance(nv, dict):
                 n = (nv.get("Name") or nv.get("name") or "").strip()
@@ -3795,44 +3879,42 @@ def _build_condition_descriptors_xml(row: Dict[str, Any], category_id: str) -> s
                 if isinstance(v, list) and v:
                     v = v[0]
                 if n:
-                    specs_dict[n] = v
-        specs = specs_dict
-    if not isinstance(specs, dict):
-        return ""
+                    flat[n] = v
+        specs = flat
+    if not isinstance(specs, dict) or not specs:
+        return []
 
-    # Build a case-insensitive lookup of the row's aspects (C: prefix stripped)
-    row_aspects: Dict[str, Any] = {}
+    by_name: Dict[str, str] = {}
     for k, v in specs.items():
         kk = str(k or "").strip()
         if kk.lower().startswith("c:"):
             kk = kk[2:].strip()
-        if kk:
-            row_aspects[kk.lower()] = v
+        if kk and v not in (None, ""):
+            by_name[kk.lower()] = str(v).strip()
+    if not by_name:
+        return []
 
-    descriptors_xml: List[str] = []
-    for asp_lower, desc_name_id in asp_to_desc.items():
-        raw_val = row_aspects.get(asp_lower)
-        if raw_val is None:
-            continue
-        if isinstance(raw_val, list):
-            raw_val = raw_val[0] if raw_val else ""
-        text = str(raw_val).strip()
-        if not text:
-            continue
-        value_id_map = _CONDITION_DESCRIPTOR_VALUE_IDS.get(desc_name_id) or {}
-        value_id = value_id_map.get(text.lower())
-        if not value_id:
-            continue
-        descriptors_xml.append(
-            "<ConditionDescriptor>"
-            f"<Name>{desc_name_id}</Name>"
-            f"<Value>{value_id}</Value>"
-            "</ConditionDescriptor>"
-        )
+    cond_raw = str(row.get("condition_id") or row.get("ConditionID") or "").strip()
+    m = re.search(r"\d+", cond_raw)
+    cond_id = m.group(0) if m else ""
 
-    if not descriptors_xml:
-        return ""
-    return "<ConditionDescriptors>" + "".join(descriptors_xml) + "</ConditionDescriptors>"
+    try:
+        descriptors = _fetch_condition_descriptors(site or "", str(category_id or ""))
+    except Exception:
+        return []
+
+    out: List[tuple[str, str]] = []
+    for d in descriptors:
+        if cond_id and d.get("condition_id") and d["condition_id"] != cond_id:
+            continue
+        wanted = by_name.get(str(d.get("name") or "").lower())
+        if not wanted:
+            continue
+        for val in d.get("values") or []:
+            if str(val.get("name") or "").lower() == wanted.lower():
+                out.append((str(d.get("id")), str(val.get("id"))))
+                break
+    return out
 
 # Trading-API-canonical aspect values that override eBay's own Taxonomy API
 # output. eBay's Taxonomy returns "Near Mint or Better" (capitalised) but the
@@ -4920,7 +5002,8 @@ def _build_item_xml(row: Dict[str, Any], site_code: str, currency: str, fixed: b
     # Structured ConditionDescriptors (trading cards etc. require this
     # alongside ConditionID; the old ItemSpecifics "Card Condition" alone
     # is not sufficient for some niche categories).
-    descriptors_xml = _build_condition_descriptors_xml(row, str(row.get("category_id") or ""))
+    descriptors_xml = _build_condition_descriptors_xml(
+        row, str(row.get("category_id") or ""), site)
     if descriptors_xml:
         parts.append(descriptors_xml)
 
@@ -5419,6 +5502,13 @@ def web_publish(request: Request, payload: Dict[str, Any] = Body(...)):
                 "start_time": (res.get("start_time") or row.get("schedule_time")),
                 "warnings": res.get("warnings"),
             })
+            # Sloot deze rij aan op een eerder AI-voorstel? Leg dan vast wat er
+            # daadwerkelijk gepubliceerd is. Dat paar is de hele bedoeling van
+            # analysis_id; zonder deze kant heb je voorstellen zonder uitkomst.
+            _row_analysis_id = str(row.get("analysis_id") or "").strip()
+            if _row_analysis_id:
+                _ai_log_published(request, _row_analysis_id, row, site=site,
+                                  outcome=("revised" if _revise else "published"))
         except HTTPException as e:
             results.append({
                 "title": row.get("title"),
@@ -6712,6 +6802,85 @@ def _check_and_increment_ai_quota(request: Request, kind: str = "other") -> None
     update_license_meta(lk, updates)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# AI-trainingsdata: voorstel gekoppeld aan wat er gepubliceerd werd
+# ═════════════════════════════════════════════════════════════════════════════
+# Elke AI-call krijgt een analysis_id terug. De desktop-app bewaart dat op de
+# rij en stuurt het mee bij publiceren. Het paar (wat stelde de AI voor, wat
+# publiceerde de verkoper) is het enige signaal dat vertelt of een suggestie
+# deugde; losse AI-antwoorden zonder uitkomst leren je niets.
+#
+# Alles loopt via db.log_event, dus het landt in request_log en is uit te lezen
+# vanuit het admin panel. Fire-and-forget: loggen mag een AI-call nooit breken.
+#
+# Bewust NIET opgeslagen:
+#   - image_b64: die blobs maken van de logtabel een fotoarchief.
+#   - de ruwe user_instruction: vrije tekst die klanten zelf intypen.
+# Call sites geven daarom zelf een opgeschoonde inputs-dict door, zodat per
+# endpoint zichtbaar is wat er wel en niet bewaard wordt.
+
+_AI_LOG_ANALYSIS = "ai_analysis"
+_AI_LOG_PUBLISHED = "ai_published"
+
+
+def _new_analysis_id() -> str:
+    return secrets.token_hex(16)
+
+
+def _ai_license_fp(request: Request) -> str:
+    """Stabiele, niet-herleidbare sleutel per licentie. Zelfde fingerprint-functie
+    als de rest van de server, zodat je per gebruiker kunt filteren zonder de
+    licentiesleutel zelf op te slaan."""
+    try:
+        lk = getattr(request.state, "license_key", None)
+        return fingerprint(lk) if lk else ""
+    except Exception:
+        return ""
+
+
+def _ai_log_analysis(request: Request, analysis_id: str, kind: str,
+                     inputs: Dict[str, Any], output: Dict[str, Any]) -> None:
+    try:
+        _db.log_event(
+            _AI_LOG_ANALYSIS,
+            ip_hash=fingerprint(_client_ip(request)),
+            license_fp=_ai_license_fp(request),
+            endpoint=kind,
+            meta={"analysis_id": analysis_id, "inputs": inputs, "output": output},
+        )
+    except Exception:
+        pass
+
+
+def _ai_log_published(request: Request, analysis_id: str, row: Dict[str, Any],
+                      site: str = "", outcome: str = "published") -> None:
+    """Leg vast wat er uiteindelijk de deur uit ging voor een eerder AI-voorstel."""
+    try:
+        specifics = row.get("item_specifics") or row.get("aspects") or {}
+        if not isinstance(specifics, dict):
+            specifics = {}
+        _db.log_event(
+            _AI_LOG_PUBLISHED,
+            ip_hash=fingerprint(_client_ip(request)),
+            license_fp=_ai_license_fp(request),
+            endpoint=outcome,
+            meta={
+                "analysis_id": analysis_id,
+                "site": site or str(row.get("site_code") or ""),
+                "final": {
+                    "title": str(row.get("title") or "")[:300],
+                    "category_id": str(row.get("category_id") or ""),
+                    "condition_id": str(row.get("condition_id") or ""),
+                    "price": row.get("price"),
+                    "quantity": row.get("quantity"),
+                    "item_specifics": {str(k): str(v)[:200] for k, v in list(specifics.items())[:60]},
+                },
+            },
+        )
+    except Exception:
+        pass
+
+
 @app.get("/license/ai_limits")
 def ai_limits_endpoint(license_key: str = "", lk: str = ""):
     """Return monthly AI-credit usage for this license key."""
@@ -6756,6 +6925,11 @@ class _AnalyzeDescIn(BaseModel):
     current_values: Dict[str, Any] = {}
     condition_options: List[Dict[str, Any]] = []
     user_instruction: str = ""   # extra writing instruction from the seller
+    # De client stuurt deze al mee, maar zonder veld hier gooide pydantic ze weg.
+    # Ze worden (nog) niet in de prompt gebruikt; ze staan hier zodat een
+    # gelogde analyse per categorie te groeperen is.
+    category_id: str = ""
+    category_name: str = ""
 
 
 _AI_SITE_LANGUAGE: Dict[str, str] = {
@@ -6867,6 +7041,7 @@ async def analyze_description(body: _AnalyzeDescIn, request: Request):
     Values MUST be from the allowed list (exact case match) or null.
     """
     _check_and_increment_ai_quota(request, kind="image")
+    analysis_id = _new_analysis_id()
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(503, "AI-service niet geconfigureerd (geen OPENAI_API_KEY op de server).")
@@ -7020,6 +7195,7 @@ async def analyze_description(body: _AnalyzeDescIn, request: Request):
             })
 
     flat_response = {
+        "analysis_id": analysis_id,
         "specifics": clean_specifics,
         "confidence": clean_confidence,
         "specifics_meta": spec_meta,
@@ -7049,6 +7225,18 @@ async def analyze_description(body: _AnalyzeDescIn, request: Request):
         ]
     except Exception:
         flat_response["candidates"] = []
+
+    _ai_log_analysis(request, analysis_id, "analyze_description", {
+        "title": str(body.title or "")[:300],
+        "description": str(body.description or "")[:2000],
+        "category_id": str(getattr(body, "category_id", "") or ""),
+        "category_name": str(getattr(body, "category_name", "") or ""),
+        "target_site": target_site,
+        "target_language": target_language,
+        "aspect_names": list(allowed_map.keys())[:60],
+        "n_condition_options": len(condition_labels),
+        "has_user_instruction": bool(str(getattr(body, "user_instruction", "") or "").strip()),
+    }, flat_response)
     return flat_response
 
 
@@ -7238,6 +7426,7 @@ async def describe_item(
     Returns a fully typed JSON response matching _DESCRIBE_ITEM_SCHEMA.
     """
     _check_and_increment_ai_quota(request, kind="voice")
+    analysis_id = _new_analysis_id()
     import tempfile
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -7438,6 +7627,23 @@ async def describe_item(
         ]
     except Exception:
         result["candidates"] = []
+
+    result["analysis_id"] = analysis_id
+    # De transcript is wat de verkoper zelf heeft ingesproken; die bewaren we
+    # wel (het is de input van de extractie), de audio zelf niet.
+    _ai_log_analysis(request, analysis_id, "describe-item", {
+        "transcript": str(result.get("transcript") or "")[:2000],
+        "language": str(language or ""),
+        "title_hint": str(title_hint or "")[:300],
+        "category_id": str(category_id or ""),
+        "category_name": str(category_name or ""),
+        "profile_name": str(profile_name or ""),
+        "target_site": target_site,
+        "target_language": target_language,
+        "aspect_names": list(allowed_by_name.keys())[:60],
+        "n_condition_options": len(condition_labels),
+        "has_user_instruction": bool(str(user_instruction or "").strip()),
+    }, result)
     return result
 
 
@@ -7505,6 +7711,7 @@ async def analyze_images_endpoint(
     Only states what is visually verifiable — no marketing language, no buyer assumptions.
     """
     _check_and_increment_ai_quota(request, kind="image")
+    analysis_id = _new_analysis_id()
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -7749,6 +7956,7 @@ async def analyze_images_endpoint(
     search_terms = _flatten_ai_category_search_terms(category_candidates, result.get("search_terms"))
 
     image_response: Dict[str, Any] = {
+        "analysis_id": analysis_id,
         "facts": clean_facts,
         "category_candidates": category_candidates,
         "search_terms": search_terms,
@@ -7775,6 +7983,20 @@ async def analyze_images_endpoint(
         ]
     except Exception:
         image_response["candidates"] = []
+
+    # image_urls wel, image_b64 alleen als aantal: zie de toelichting bij
+    # _ai_log_analysis. user_instruction blijft een boolean, geen inhoud.
+    _ai_log_analysis(request, analysis_id, "analyze-images", {
+        "image_urls": [str(u) for u in urls[:6]],
+        "n_image_b64": len(b64_list[:6]),
+        "title_hint": str(title_hint or "")[:300],
+        "category_id": str(category_id or ""),
+        "category_name": str(category_name or ""),
+        "target_site": str(target_site or ""),
+        "aspect_names": list(allowed_by_name.keys())[:60],
+        "n_condition_options": len(condition_labels),
+        "has_user_instruction": bool(str(user_instruction or "").strip()),
+    }, image_response)
     return image_response
 
 
