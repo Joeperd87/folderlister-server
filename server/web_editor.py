@@ -1522,11 +1522,19 @@ function conditionAllowsDescription(label, allowedList){
             const did = col.key.slice(9);
             const d = descriptorForRow(row, did);
             if (!d){
-              // Geldt niet voor deze rij, bijvoorbeeld Card Condition bij een
-              // graded kaart. Leeg laten in plaats van een misleidend veld.
+              // Geldt niet bij de conditie die op deze rij staat. Card
+              // Condition hoort bij Ungraded, Grader en Grade bij Graded.
+              // Zeg dat er dan bij: een kaal streepje laat de verkoper raden.
+              const all = getConditionDescriptors(row.category_id)
+                            .filter(x => String(x.id) === String(did));
+              const needs = all.map(x => x.condition_id).filter(Boolean);
               const span = document.createElement('span');
               span.textContent = '-';
               span.style.color = 'var(--MUTED)';
+              span.title = needs.length
+                ? ('Alleen van toepassing bij conditie ' + needs.join(' of ')
+                   + '. Deze rij staat op ' + (conditionIdOf(row) || 'geen conditie') + '.')
+                : 'Niet van toepassing op deze rij.';
               put(span); return;
             }
             const sel = document.createElement('select');

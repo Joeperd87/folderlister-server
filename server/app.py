@@ -2984,76 +2984,66 @@ def web_aspects(request: Request, site: Optional[str] = Query(None), category_id
 
     return {"aspects": aspects}
 
+# Variatie-ondersteuning per categorie. Liep eerst via Trading
+# GetCategoryFeatures; die call is door eBay uitgezet en antwoordt met
+# HTTP 410 en een lege body (gemeten 14-08-2026: GeteBayDetails en GetUser
+# geven op hetzelfde token en moment gewoon een nette foutmelding terug,
+# GetCategoryFeatures komt niet eens bij de authenticatie aan). Daardoor
+# kon de app niet meer vaststellen of een categorie variaties toestaat en
+# kreeg de verkoper de melding "probeer over een paar minuten opnieuw",
+# wat nooit ging werken. Sell Metadata heeft er een eigen veld voor.
+_VARIATIONS_CACHE: Dict[str, Dict[str, Any]] = {}
+_VARIATIONS_TTL = 6 * 3600
+
+
 @app.get("/web/category/variations_enabled")
 def web_category_variations_enabled(request: Request,
                                     site: str = Query("NL"),
                                     category_id: str = Query(...)):
-    """Quick check if a category supports variations (Trading: GetCategoryFeatures).
+    """Ondersteunt deze categorie listings met variaties?
 
-    This prevents the confusing Trading failure:
-    'Variations are not available for this listing...'
+    Voorkomt de verwarrende Trading-fout 'Variations are not available for
+    this listing...' door het vooraf te vragen.
     """
+    import time as _t
     ensure_valid_license_only(request)
 
     site, _ = _effective_site_and_currency(site, None)
     site = (site or "NL").upper()
 
-    _refresh_user_if_needed()
-    u = _need_user()
-    env = (u.get("env") or "PROD").upper()
-    site_id = TRADING_SITE_ID.get(site.upper(), "0")
+    key = f"{site}|{category_id}"
+    hit = _VARIATIONS_CACHE.get(key)
+    if hit and (_t.time() - hit.get("_ts", 0)) < _VARIATIONS_TTL:
+        return hit["data"]
 
-    xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<GetCategoryFeaturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <ErrorLanguage>en_US</ErrorLanguage>
-  <WarningLevel>High</WarningLevel>
-  <DetailLevel>ReturnAll</DetailLevel>
-  <CategoryID>{category_id}</CategoryID>
-  <FeatureID>VariationsEnabled</FeatureID>
-</GetCategoryFeaturesRequest>""".strip()
+    marketplace = MARKETPLACE_ID.get(site)
+    if not marketplace:
+        raise HTTPException(400, f"Unknown site {site}")
 
-    headers = {
-        "X-EBAY-API-CALL-NAME": "GetCategoryFeatures",
-        "X-EBAY-API-SITEID": site_id,
-        "X-EBAY-API-COMPATIBILITY-LEVEL": "1193",
-        "X-EBAY-API-IAF-TOKEN": u["access_token"],
-        "Content-Type": "text/xml",
-    }
-
-    r = requests.post(TRADING_ENDPOINT[env], headers=headers, data=xml.encode("utf-8"), timeout=30)
+    env = (_get_user().get("env") or "PROD")
+    path = f"/sell/metadata/v1/marketplace/{marketplace}/get_listing_structure_policies"
+    r = _commerce_get(env, path, {"filter": "categoryIds:{" + str(category_id) + "}"})
     if r.status_code >= 400:
-        detail = (r.text or "").strip()
-        if not detail:
-            detail = (
-                f"Couldn't confirm whether category {category_id} ({site}) supports "
-                f"variations -- eBay's category-features check returned no details "
-                f"(HTTP {r.status_code}). This is usually temporary on eBay's side; if "
-                f"posting later fails with a 'variations not supported' error, try "
-                f"again in a few minutes."
-            )
-        raise HTTPException(status_code=r.status_code, detail=detail)
+        raise HTTPException(r.status_code,
+                            f"Could not check variation support for category {category_id} "
+                            f"({site}): eBay returned HTTP {r.status_code}.")
 
-    ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
-    root = ET.fromstring(r.content)
-    ack = (root.findtext("e:Ack", default="", namespaces=ns) or "").strip().upper()
-    if ack == "FAILURE":
-        # bubble up readable error
-        errs = []
-        for e in root.findall("e:Errors", ns):
-            code = (e.findtext("e:ErrorCode", default="", namespaces=ns) or "").strip()
-            msg  = (e.findtext("e:LongMessage", default="", namespaces=ns) or e.findtext("e:ShortMessage", default="", namespaces=ns) or "").strip()
-            if msg or code:
-                errs.append(f"{code}: {msg}".strip(": ").strip())
-        raise HTTPException(502, "Trading failure: " + " | ".join(errs) if errs else "Trading failure")
-
-    enabled = False
-    for n in root.findall(".//e:VariationsEnabled", ns):
-        t = (n.text or "").strip().lower()
-        if t in ("true", "1", "yes"):
-            enabled = True
+    enabled = None
+    for pol in (r.json() or {}).get("listingStructurePolicies") or []:
+        if str(pol.get("categoryId") or "") == str(category_id):
+            enabled = bool(pol.get("variationsSupported"))
             break
 
-    return {"ok": True, "site": site, "category_id": str(category_id), "variations_enabled": enabled}
+    if enabled is None:
+        # Categorie zat niet in het antwoord. Niet blokkeren op iets dat we
+        # niet weten; de client mag doorgaan en eBay beslist bij publiceren.
+        return {"ok": True, "site": site, "category_id": str(category_id),
+                "variations_enabled": True, "known": False}
+
+    out = {"ok": True, "site": site, "category_id": str(category_id),
+           "variations_enabled": enabled, "known": True}
+    _VARIATIONS_CACHE[key] = {"_ts": _t.time(), "data": out}
+    return out
 
 
 
