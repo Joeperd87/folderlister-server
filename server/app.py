@@ -592,9 +592,9 @@ def license_switch_to_current(request: Request):
 
     # 4) cooldown bewaken (standaard 21 dagen, aanpasbaar via env)
     try:
-        cooldown_days = int(os.getenv("JOEP_SWITCH_COOLDOWN_DAYS", "21"))
+        cooldown_days = int(os.getenv("JOEP_SWITCH_COOLDOWN_DAYS", "60"))
     except Exception:
-        cooldown_days = 21
+        cooldown_days = 60
 
     last = rec.get("last_switch_at") or rec.get("bound_at")
     if last:
