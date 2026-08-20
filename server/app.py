@@ -2865,59 +2865,13 @@ async def media_eps_upload(
 
 
 
-@app.post("/web/eps_count_external")
-def eps_count_external(request: Request, payload: Dict[str, Any] = Body(...)):
-    """Count external-image-host usage toward the monthly EPS counter.
-
-    Used when a listing is published with externally-hosted picture URLs
-    (e.g. from an InkFrog CSV import) so no actual EPS upload happens, but
-    the seller still gets app-usage tracking. Increments the same monthly
-    counter the upload endpoint uses; returns current used/limit/remaining.
-
-    Body: {"count": <int>, "site": <optional>, "env": <optional>}
-    """
-    lk = (request.headers.get("X-License-Key") or request.cookies.get("license_key")
-          or request.query_params.get("lk") or "").strip()
-    if not lk:
-        raise HTTPException(401, "Valid license required")
-    rec = find_license(lk)
-    if not (rec and is_valid(rec)):
-        raise HTTPException(401, "Valid license required")
-    try:
-        n = int(payload.get("count") or 0)
-    except Exception:
-        n = 0
-    if n <= 0:
-        raise HTTPException(400, "count must be a positive integer")
-    n = min(n, 500)  # safety cap per call
-    try:
-        uid, uname, _env = _identity_get_user()
-    except Exception:
-        uid = uname = ""
-    usage_key = _eps_usage_key_for_license(lk, rec, uid, uname)
-    limit = get_limit_for_record(rec)
-    st = get_usage(usage_key)
-    used = int(st.get("count") or 0)
-    if limit is not None and used + n > int(limit):
-        return JSONResponse(
-            {"ok": False, "detail": "eps_daily_limit_exceeded",
-             "used_today": used, "limit": int(limit),
-             "remaining": max(0, int(limit) - used)},
-            status_code=429,
-        )
-    from .eps_limits import increment as _eps_inc
-    _eps_inc(usage_key, n)
-    st = get_usage(usage_key)
-    used = int(st.get("count") or 0)
-    remaining = None if limit is None else max(0, int(limit) - used)
-    return {
-        "ok": True,
-        "counted": n,
-        "eps_daily_limit": limit,
-        "eps_used_today": used,
-        "eps_remaining_today": remaining,
-        "source": "external_host",
-    }
+# /web/eps_count_external is bewust verwijderd (2026-08-20). Het telde
+# extern gehoste foto's mee in de maandteller, voor InkFrog-imports die
+# nooit echt gebruikt zijn. De client stuurde die call ook na een gewone
+# upload, waardoor elke foto dubbel geteld werd. De app uploadt nu altijd
+# zijn eigen foto's, dus er is niets meer om extern te tellen. Bewust geen
+# lege stub: oude builds die de call nog doen krijgen een 404 en negeren
+# die -- daarmee stopt de dubbeltelling ook zonder dat ze updaten.
 
 
 @app.get("/license/limits")
@@ -5696,9 +5650,13 @@ class LicenseOut(BaseModel):
 # --- License-validate rate-limiter / anti-bruteforce ----------------------
 #
 #  Policy (per source-IP, sliding 1-hour window):
-#   - 1st attempt is free
-#   - 2nd+ attempt requires a verified email (uses /email/verify flow)
-#   - 5 failed attempts within 1h triggers a hard cooldown (1h)
+#   - the first 3 distinct wrong keys are free
+#   - after that, an attempt requires a verified email (/email/verify flow)
+#   - 5 distinct wrong keys within 1h triggers a hard cooldown (1h)
+#
+#  Counting is per *distinct* key, not per request: re-checking one wrong
+#  or expired key (which the desktop app does on every start) costs a
+#  single attempt, no matter how often it happens. See _la_record_failure.
 #
 #  State persists to data/license_attempts.json so a restart doesn't reset
 #  the protection. Successful validate clears the IP record.
@@ -5755,14 +5713,36 @@ def _la_get(ip: str) -> dict:
         return rec
 
 
-def _la_record_failure(ip: str) -> dict:
+def _la_record_failure(ip: str, key_fp: str = "") -> dict:
+    """Count one failed attempt, but only once per distinct key.
+
+    Brute force means trying many *different* keys. Re-checking the same
+    wrong or expired key is not an attack: the desktop app revalidates the
+    stored key on every start and whenever the licence menu opens, so a
+    customer whose licence expired used to burn the whole budget before
+    typing a single character — and then could not enter the new key
+    anymore, because the verify gate runs before the key lookup.
+
+    So we keep a list of key fingerprints (HMAC-derived, never the plain
+    key) seen in this window and only increment for one we have not seen.
+    """
     now = int(time.time())
     with _LICENSE_ATTEMPTS_LOCK:
         d = _la_load()
         rec = d.get(ip) or {}
         first = int(rec.get("first_fail_ts") or 0)
         if not first or (now - first) > _LICENSE_ATTEMPT_WINDOW_S:
-            rec = {"failures": 0, "first_fail_ts": now}
+            rec = {"failures": 0, "first_fail_ts": now, "keys": []}
+        seen = list(rec.get("keys") or [])
+        if key_fp and key_fp in seen:
+            # Same key as before: no new attempt, just refresh the stamp.
+            rec["last_fail_ts"] = now
+            d[ip] = rec
+            _la_save(d)
+            return rec
+        if key_fp:
+            seen.append(key_fp)
+            rec["keys"] = seen[-20:]
         rec["failures"] = int(rec.get("failures") or 0) + 1
         rec["last_fail_ts"] = now
         d[ip] = rec
@@ -5850,7 +5830,12 @@ def license_validate(payload: LicenseIn, request: Request):
             "allowed_ebay_users": (rec or {}).get("allowed_ebay_users") or [],
         }
     # Validation failed: increment counter and tell client what's next.
-    state2 = _la_record_failure(ip)
+    # Pass the key fingerprint so repeat checks of one key count once.
+    try:
+        _fp = fingerprint(_lk) if _lk else ""
+    except Exception:
+        _fp = ""
+    state2 = _la_record_failure(ip, _fp)
     failures2 = int(state2.get("failures") or 0)
     body = {
         "valid": False,

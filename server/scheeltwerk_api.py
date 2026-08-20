@@ -70,7 +70,7 @@ async def scheeltwerk_brainstorm(request: Request):
     bedrijf = str(body.get("bedrijf") or "").strip()
     vastlopen = str(body.get("vastlopen") or "").strip()
     _resend_mail(
-        to="jlitjens@gmail.com",
+        to="joep@scheeltwerk.nl",
         subject=f"Nieuwe brainstorm aanvraag: {naam} ({bedrijf})",
         html=f"""<h2>Nieuwe brainstorm aanvraag via scheeltwerk.nl</h2>
 <p><strong>Naam:</strong> {naam}<br>

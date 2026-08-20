@@ -268,6 +268,11 @@ def web_editor() -> HTMLResponse:
 
   /* overlay dialog */
   .dlg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:50}
+  .batch-row{padding:8px 10px;border-radius:8px;background:var(--SURFACE_HI);cursor:pointer;border:1px solid transparent}
+  .batch-row:hover{border-color:var(--ACCENT)}
+  .batch-row.active{border-color:var(--ACCENT);background:var(--SURFACE_ELEV)}
+  .batch-main{font-size:13px;font-weight:600}
+  .batch-meta{font-size:11px;color:var(--MUTED);margin-top:2px}
   #dlgImages{z-index:60}
   .dlg .card{background:#0f2e36;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.35);max-width:900px;width:min(90vw,1100px);color:var(--TEXT)}
   .card header{background:var(--SURFACE_ELEV);color:var(--TEXT);border-bottom:1px solid var(--BORDER);padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
@@ -323,6 +328,7 @@ def web_editor() -> HTMLResponse:
   <label class="toolbar-check"><input id="checkAll" type="checkbox" checked> Check all</label>
   <label class="toolbar-check"><input id="toggleHidden" type="checkbox" checked> Show hidden fields</label>
   <button id="btnColumns">Columns</button>
+  <button id="btnBatches" title="Open an earlier batch of this account">Batches...</button>
   <button id="btnVariations" style="display:none">Variations…</button>
   <button id="btnTogglePublished" style="display:none" title="Toon/verberg al gepubliceerde items van deze sessie">Show published (0)</button>
 
@@ -501,6 +507,24 @@ def web_editor() -> HTMLResponse:
       <button id="colReset">Reset</button>
       <button id="colApply" class="dark">Apply</button>
     </footer>
+  </div>
+</div>
+
+<!-- Batches dialog -->
+<div id="dlgBatches" class="dlg" role="dialog" aria-modal="true">
+  <div class="card" style="width:min(90vw,620px)">
+    <header>
+      <h3>Batches</h3>
+      <button id="batchClose">Close</button>
+    </header>
+    <div class="body">
+      <div class="muted" style="margin-bottom:8px;font-size:12px">
+        Your saved batches, newest first. Opening one replaces what is on screen &mdash;
+        nothing goes to eBay until you press Publish.
+      </div>
+      <div id="batchList" style="max-height:296px;overflow-y:auto;display:flex;flex-direction:column;gap:6px"></div>
+      <div id="batchNote" class="muted" style="margin-top:8px;font-size:11px"></div>
+    </div>
   </div>
 </div>
 
@@ -2369,6 +2393,71 @@ r.aspects = asp || {}; r.aspects[k] = valRaw || null;
     });
   }
 
+  // ------------------- batch picker -------------------
+  // Which batch is on screen, so the list can mark it. Filled by build().
+  let CURRENT_DRAFT_ID = null;
+
+  function escB(v){
+    return String(v == null ? '' : v)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function fmtWhen(iso){
+    if (!iso) return '';
+    try {
+      const d = new Date(/Z$/.test(iso) ? iso : (iso + 'Z'));
+      if (isNaN(d.getTime())) return iso;
+      return d.toLocaleString([], {day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'});
+    } catch(_){ return iso; }
+  }
+
+  function openBatches(){
+    const list = $('batchList'), note = $('batchNote');
+    list.innerHTML = '<div class="muted" style="padding:10px">Loading...</div>';
+    note.textContent = '';
+    $('dlgBatches').style.display = 'flex';
+    getJSON('/web/drafts')
+      .then(d => {
+        const items = (d && d.drafts) || [];
+        if (!items.length){
+          list.innerHTML = '<div class="muted" style="padding:10px">No saved batches yet.</div>';
+          return;
+        }
+        list.innerHTML = items.map(it => {
+          const active = (CURRENT_DRAFT_ID != null && String(it.id) === String(CURRENT_DRAFT_ID));
+          const label = it.title ? it.title : '(untitled batch)';
+          const n = Number(it.items || 0);
+          const meta = fmtWhen(it.saved_at) + ' - ' + n + (n === 1 ? ' item' : ' items')
+                     + (active ? ' - open now' : '');
+          return '<div class="batch-row' + (active ? ' active' : '') + '" data-id="' + escB(it.id) + '">'
+               + '<div class="batch-main">' + escB(label) + '</div>'
+               + '<div class="batch-meta">' + escB(meta) + '</div>'
+               + '</div>';
+        }).join('');
+        note.textContent = 'The last ' + (d.keep || items.length)
+                         + ' batches are kept; older ones are removed automatically.';
+      })
+      .catch(e => {
+        list.innerHTML = '<div class="muted" style="padding:10px">Could not load batches: '
+                       + escB((e && e.message) || e) + '</div>';
+      });
+  }
+
+  function closeBatches(){ $('dlgBatches').style.display = 'none'; }
+
+  $('btnBatches').addEventListener('click', openBatches);
+  $('batchClose').addEventListener('click', closeBatches);
+  $('dlgBatches').addEventListener('click', (ev) => {
+    if (ev.target === $('dlgBatches')) { closeBatches(); return; }
+    const row = ev.target && ev.target.closest ? ev.target.closest('.batch-row') : null;
+    if (!row) return;
+    const id = row.getAttribute('data-id');
+    if (!id) return;
+    closeBatches();
+    build('?draft_id=' + encodeURIComponent(id));
+  });
+
   // ------------------- data flow -------------------
   function build(query){
     if (query === undefined) query = '';
@@ -2381,6 +2470,7 @@ r.aspects = asp || {}; r.aspects[k] = valRaw || null;
       .then(d => {
         SITE     = (d.site     || 'NL').toUpperCase();
         CURRENCY = (d.currency || 'EUR').toUpperCase();
+        CURRENT_DRAFT_ID = (d.draft_id != null ? d.draft_id : null);
 
         console.log('Draft site/currency:', SITE, CURRENCY);
 
@@ -2910,11 +3000,77 @@ if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
 # Data endpoints used by the editor
 # =============================================================================
 
+# How many batches we keep per license. The picker shows five at a time and
+# scrolls to the rest; everything older is dropped on the next save. Drafts are
+# fat (a few hundred KB each, occasionally over a megabyte), so an unbounded
+# history costs real disk for a history nobody opens.
+_DRAFT_KEEP = 20
+
+
+def _summarize_draft_payload(data: Any) -> tuple:
+    """(item_count, title_hint) for the batch picker."""
+    try:
+        if isinstance(data, str):
+            data = json.loads(data or "{}")
+        rows = (data or {}).get("rows") or []
+        first = rows[0] if rows else {}
+        title = str(first.get("title") or first.get("clean_title") or "").strip()
+        return len(rows), title[:120]
+    except Exception:
+        return 0, ""
+
+
+@router.get("/web/drafts")
+def web_drafts(request: Request, lk: Optional[str] = Query(None)):
+    """List this license's recent batches for the picker in the editor.
+
+    Returns summaries only — never the payload, see db.draft_list_summaries.
+    """
+    lk_eff = (
+        getattr(request.state, "license_key", "")
+        or request.headers.get("X-License-Key")
+        or lk
+        or ""
+    ).strip()
+    if not lk_eff:
+        raise HTTPException(status_code=403, detail="License required")
+
+    bucket = _draft_bucket_for_lk(lk_eff)
+    from . import db as _db
+
+    out = []
+    for row in _db.draft_list_summaries(bucket, limit=_DRAFT_KEEP):
+        count = row.get("item_count")
+        title = row.get("title_hint")
+        if count is None:
+            # Saved before the picker existed: summarize once and store it, so
+            # the next listing does not have to read this payload again.
+            full = _db.draft_get(row["id"]) or {}
+            count, title = _summarize_draft_payload(full.get("data"))
+            try:
+                _db.draft_set_summary(row["id"], count, title)
+            except Exception:
+                pass
+        out.append({
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "saved_at": row.get("updated_at") or row.get("created_at"),
+            "items": int(count or 0),
+            "title": title or "",
+            "size_kb": round(float(row.get("size_bytes") or 0) / 1024.0, 1),
+        })
+    return {"drafts": out, "keep": _DRAFT_KEEP}
+
+
 @router.get("/web/draft")
-def web_draft(request: Request, path: Optional[str] = Query(None), lk: Optional[str] = Query(None)):
+def web_draft(request: Request, path: Optional[str] = Query(None), lk: Optional[str] = Query(None),
+              draft_id: Optional[int] = Query(None)):
     """
     Draft laden — database-backed.
     Falls back to filesystem for legacy drafts that haven't been migrated yet.
+
+    Without draft_id you get the most recent batch (the old behaviour). With
+    draft_id you get that specific batch, provided it belongs to this license.
     """
     _ = path
     lk_eff = (
@@ -2928,7 +3084,15 @@ def web_draft(request: Request, path: Optional[str] = Query(None), lk: Optional[
 
     # Try database first
     from . import db as _db
-    draft = _db.draft_latest(bucket)
+    if draft_id:
+        candidate = _db.draft_get(int(draft_id))
+        # The id is a plain auto-increment integer, so anyone could guess a
+        # neighbour's. Only serve it when it sits in this license's bucket.
+        if not candidate or candidate.get("bucket") != bucket:
+            raise HTTPException(status_code=404, detail="Batch not found for this license.")
+        draft = candidate
+    else:
+        draft = _db.draft_latest(bucket)
     if draft:
         try:
             data = json.loads(draft["data"]) if isinstance(draft["data"], str) else draft["data"]
@@ -2937,7 +3101,9 @@ def web_draft(request: Request, path: Optional[str] = Query(None), lk: Optional[
         rows = data.get("rows") or []
         site = (data.get("site") or "NL").upper()
         currency = (data.get("currency") or "EUR").upper()
-        return {"rows": rows, "site": site, "currency": currency, "path": draft.get("name", "db")}
+        return {"rows": rows, "site": site, "currency": currency,
+                "path": draft.get("name", "db"), "draft_id": draft.get("id"),
+                "saved_at": draft.get("updated_at") or draft.get("created_at")}
 
     # Fallback: legacy filesystem drafts
     chosen = _latest_draft_path_for(lk_eff)
@@ -2974,7 +3140,14 @@ def web_draft_upload(request: Request, payload: Dict[str, Any]):
     body.pop("license_key", None)
 
     from . import db as _db
-    draft_id = _db.draft_save(bucket=bucket, name=f"draft-{ts}", data=body)
+    count, title = _summarize_draft_payload(body)
+    draft_id = _db.draft_save(bucket=bucket, name=f"draft-{ts}", data=body,
+                              item_count=count, title_hint=title)
+    # Keep the history bounded; the picker only reaches back _DRAFT_KEEP batches.
+    try:
+        _db.draft_prune_bucket(bucket, keep=_DRAFT_KEEP)
+    except Exception:
+        pass
     return {"ok": True, "path": f"draft-{ts}", "bucket": bucket, "draft_id": draft_id}
 
 @router.get("/web/conditions_dummy")

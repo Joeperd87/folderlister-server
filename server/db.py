@@ -171,7 +171,9 @@ CREATE TABLE IF NOT EXISTS drafts (
     name            TEXT,
     data            TEXT    NOT NULL,             -- JSON blob
     created_at      TEXT,
-    updated_at      TEXT
+    updated_at      TEXT,
+    item_count      INTEGER,                        -- rows in the draft
+    title_hint      TEXT                            -- first row title
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_license_bucket ON drafts(license_id, bucket);
 
@@ -194,10 +196,31 @@ CREATE TABLE IF NOT EXISTS oauth_state (
 """
 
 
+def _ensure_columns(conn, table: str, columns: Dict[str, str]) -> None:
+    """Add missing columns to a table that already exists.
+
+    _SCHEMA_SQL only holds CREATE TABLE IF NOT EXISTS, so a table created by an
+    older version keeps its old shape no matter what we add to the schema. An
+    ALTER TABLE ADD COLUMN is cheap (SQLite only updates the table header) and
+    idempotent thanks to the table_info check, so this is safe on every boot.
+    """
+    try:
+        have = {row[1] for row in conn.execute("PRAGMA table_info(" + table + ")")}
+    except Exception:
+        return
+    for name, decl in columns.items():
+        if name not in have:
+            try:
+                conn.execute("ALTER TABLE " + table + " ADD COLUMN " + name + " " + decl)
+            except Exception:
+                pass
+
+
 def init_db():
     """Create all tables if they don't exist. Safe to call multiple times."""
     conn = get_conn()
     conn.executescript(_SCHEMA_SQL)
+    _ensure_columns(conn, "drafts", {"item_count": "INTEGER", "title_hint": "TEXT"})
     current_version = conn.execute("PRAGMA user_version").fetchone()[0]
     if current_version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -609,13 +632,21 @@ def ip_ban_list() -> List[Dict[str, Any]]:
 # DRAFTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def draft_save(bucket: str, name: str, data: dict, license_id: int = None) -> int:
-    """Save a draft. Returns the draft id."""
+def draft_save(bucket: str, name: str, data: dict, license_id: int = None,
+               item_count: int = None, title_hint: str = None) -> int:
+    """Save a draft. Returns the draft id.
+
+    item_count/title_hint are a summary for the batch picker, stored next to the
+    payload so listing the batches never has to parse megabytes of JSON.
+    """
     conn = get_conn()
     now = _now_iso()
     cur = conn.execute(
-        "INSERT INTO drafts (license_id, bucket, name, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (license_id, bucket, name, json.dumps(data), now, now),
+        "INSERT INTO drafts (license_id, bucket, name, data, created_at, updated_at,"
+        " item_count, title_hint) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (license_id, bucket, name, json.dumps(data), now, now,
+         (int(item_count) if item_count is not None else None),
+         (str(title_hint)[:120] if title_hint else None)),
     )
     conn.commit()
     return cur.lastrowid
@@ -640,7 +671,7 @@ def draft_get(draft_id: int) -> Optional[Dict[str, Any]]:
 def draft_latest(bucket: str) -> Optional[Dict[str, Any]]:
     """Get the most recent draft for a bucket."""
     row = get_conn().execute(
-        "SELECT * FROM drafts WHERE bucket=? ORDER BY updated_at DESC LIMIT 1",
+        "SELECT * FROM drafts WHERE bucket=? ORDER BY updated_at DESC, id DESC LIMIT 1",
         (bucket,),
     ).fetchone()
     return dict(row) if row else None
@@ -649,10 +680,52 @@ def draft_latest(bucket: str) -> Optional[Dict[str, Any]]:
 def draft_list_by_bucket(bucket: str, limit: int = 50) -> List[Dict[str, Any]]:
     """List drafts for a bucket, most recent first."""
     rows = get_conn().execute(
-        "SELECT * FROM drafts WHERE bucket=? ORDER BY updated_at DESC LIMIT ?",
+        "SELECT * FROM drafts WHERE bucket=? ORDER BY updated_at DESC, id DESC LIMIT ?",
         (bucket, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def draft_list_summaries(bucket: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """List drafts of one bucket without their payload, newest first.
+
+    Deliberately leaves `data` out of the SELECT: a single bucket can hold tens
+    of drafts of several hundred KB, and the picker only needs name, date, size
+    and the stored summary.
+    """
+    rows = get_conn().execute(
+        "SELECT id, bucket, name, created_at, updated_at, item_count, title_hint,"
+        " length(data) AS size_bytes"
+        " FROM drafts WHERE bucket=? ORDER BY updated_at DESC, id DESC LIMIT ?",
+        (bucket, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def draft_set_summary(draft_id: int, item_count: int, title_hint: str) -> None:
+    """Fill in the picker summary for a draft saved before it existed."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE drafts SET item_count=?, title_hint=? WHERE id=?",
+        (int(item_count or 0), (str(title_hint)[:120] if title_hint else ""), draft_id),
+    )
+    conn.commit()
+
+
+def draft_prune_bucket(bucket: str, keep: int = 20) -> int:
+    """Drop everything but the newest `keep` drafts of one bucket.
+
+    Called on every save, so storage per license stays bounded instead of
+    growing for as long as someone keeps publishing.
+    """
+    conn = get_conn()
+    cur = conn.execute(
+        "DELETE FROM drafts WHERE bucket=? AND id NOT IN ("
+        "SELECT id FROM drafts WHERE bucket=? ORDER BY updated_at DESC, id DESC LIMIT ?)",
+        (bucket, bucket, int(keep)),
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def draft_delete(draft_id: int) -> None:
