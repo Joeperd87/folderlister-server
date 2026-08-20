@@ -44,7 +44,7 @@ from datetime import datetime, timedelta  # (als 'timedelta' nog niet geïmporte
 from .license_store import FILE as LICENSE_FILE, upsert_license_plain, find_license, attach_identity_id, fingerprint, update_license_meta # je gebruikt deze al elders
 
 from .eps_limits import get_usage, get_limit_for_record, plan_max_accounts, next_reset_date
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import os  # voor JOEP_USAGE_TZ
 from .license_store import find_license, is_valid, upsert_license_plain, fingerprint, attach_ebay_user, attach_identity_id, detach_ebay_user, detach_identity_id
 from .trial_store import already_had_trial, record_trial
@@ -935,6 +935,76 @@ def get_app_token(env: str) -> str:
         tk[key] = {"access_token": j["access_token"], "expires_at": _now() + int(j.get("expires_in", 7200))}
         _save_tokens(tk)
     return j["access_token"]
+
+
+def _account_deletion_config() -> tuple[str, str]:
+    token = os.getenv("EBAY_ACCOUNT_DELETION_TOKEN", "").strip()
+    endpoint = os.getenv("EBAY_ACCOUNT_DELETION_ENDPOINT", "").strip()
+    return token, endpoint
+
+
+@app.get("/ebay/marketplace-account-deletion")
+def ebay_account_deletion_challenge(challenge_code: str = Query(...)):
+    """Answer eBay's ownership challenge for the configured callback URL."""
+    from .ebay_account_deletion import challenge_response
+
+    token, endpoint = _account_deletion_config()
+    try:
+        answer = challenge_response(challenge_code, token, endpoint)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"challengeResponse": answer}
+
+
+@app.post("/ebay/marketplace-account-deletion")
+async def ebay_account_deletion_notification(request: Request):
+    """Verify an eBay deletion notification, then irreversibly purge its data."""
+    from .ebay_account_deletion import verify_signature
+
+    signature = (request.headers.get("X-EBAY-SIGNATURE") or "").strip()
+    if not signature:
+        raise HTTPException(status_code=412, detail="Missing X-EBAY-SIGNATURE")
+    try:
+        message = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    try:
+        authentic = verify_signature(message, signature, lambda: get_app_token("PROD"))
+    except Exception:
+        # Do not disclose crypto/API details on this public endpoint.
+        raise HTTPException(status_code=412, detail="Notification signature validation failed")
+    if not authentic:
+        raise HTTPException(status_code=412, detail="Invalid notification signature")
+
+    if (message.get("metadata") or {}).get("topic") != "MARKETPLACE_ACCOUNT_DELETION":
+        raise HTTPException(status_code=400, detail="Unsupported notification topic")
+    notification = message.get("notification") or {}
+    data = notification.get("data") or {}
+    user_id = str(data.get("userId") or "").strip()
+    username = str(data.get("username") or "").strip()
+    if not user_id and not username:
+        raise HTTPException(status_code=400, detail="Notification contains no eBay user identifier")
+
+    try:
+        deleted = _db.delete_ebay_account_data(user_id, username)
+    except Exception:
+        # Acknowledge only after the transactional purge succeeded; otherwise
+        # eBay will retry instead of silently losing the deletion request.
+        raise HTTPException(status_code=503, detail="Deletion processing failed")
+    try:
+        _db.log_event(
+            "ebay_account_deletion",
+            meta={
+                "notification_id": str(notification.get("notificationId") or ""),
+                "deleted": deleted,
+            },
+        )
+    except Exception:
+        # The privacy deletion itself succeeded; a logging outage must not make
+        # eBay retry an already completed destructive operation.
+        pass
+    return Response(status_code=204)
 
 def _set_user_token(env: str, access_token: str, refresh_token: Optional[str], expires_in: int) -> None:
     with _TOKENS_LOCK:

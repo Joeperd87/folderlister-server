@@ -355,6 +355,109 @@ def ebay_account_find_by_identity(identity_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def delete_ebay_account_data(identity_id: str, username: str = "") -> Dict[str, int]:
+    """Permanently remove data associated with an eBay account deletion."""
+    identity_id = (identity_id or "").strip()
+    username = (username or "").strip().lower()
+    if not identity_id and not username:
+        raise ValueError("identity_id or username required")
+
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT license_id, ebay_user FROM ebay_accounts "
+        "WHERE (? <> '' AND identity_id=?) OR (? <> '' AND lower(ebay_user)=?)",
+        (identity_id, identity_id, username, username),
+    ).fetchall()
+    license_ids = {int(row["license_id"]) for row in rows}
+    account_names = {
+        str(row["ebay_user"] or "").strip().lower() for row in rows if row["ebay_user"]
+    }
+    if username:
+        account_names.add(username)
+
+    deleted = {"accounts": 0, "tokens": 0, "drafts": 0, "trials": 0, "license_meta": 0}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "DELETE FROM ebay_accounts WHERE "
+            "(? <> '' AND identity_id=?) OR (? <> '' AND lower(ebay_user)=?)",
+            (identity_id, identity_id, username, username),
+        )
+        deleted["accounts"] = max(0, cur.rowcount)
+
+        # User OAuth rows carry ebay_user in their JSON extra field. App
+        # tokens never do and therefore remain available for key validation.
+        for token in conn.execute("SELECT context, extra FROM tokens").fetchall():
+            try:
+                extra = json.loads(token["extra"] or "{}")
+            except Exception:
+                extra = {}
+            token_user = str(extra.get("ebay_user") or "").strip().lower()
+            token_identity = str(extra.get("identity_id") or "").strip()
+            if ((token_user and token_user in account_names) or
+                    (identity_id and token_identity == identity_id)):
+                cur = conn.execute("DELETE FROM tokens WHERE context=?", (token["context"],))
+                deleted["tokens"] += max(0, cur.rowcount)
+
+        # Drafts are license-bound rather than account-bound. If no other eBay
+        # account remains, those drafts belong only to the deleted account.
+        for license_id in license_ids:
+            remaining = conn.execute(
+                "SELECT 1 FROM ebay_accounts WHERE license_id=? LIMIT 1", (license_id,)
+            ).fetchone()
+            if not remaining:
+                cur = conn.execute("DELETE FROM drafts WHERE license_id=?", (license_id,))
+                deleted["drafts"] += max(0, cur.rowcount)
+
+            row = conn.execute("SELECT meta FROM licenses WHERE id=?", (license_id,)).fetchone()
+            try:
+                meta = json.loads((row["meta"] if row else None) or "{}")
+            except Exception:
+                meta = {}
+            changed = False
+            if identity_id and str(meta.get("last_bound_identity") or "") == identity_id:
+                meta.pop("last_bound_identity", None)
+                changed = True
+            if username and str(meta.get("last_bound_username") or "").strip().lower() == username:
+                meta.pop("last_bound_username", None)
+                changed = True
+            identity_names = meta.get("identity_usernames")
+            if isinstance(identity_names, dict):
+                for key, value in list(identity_names.items()):
+                    if ((identity_id and str(key) == identity_id) or
+                            (username and str(value or "").strip().lower() == username)):
+                        identity_names.pop(key, None)
+                        changed = True
+                if identity_names:
+                    meta["identity_usernames"] = identity_names
+                else:
+                    meta.pop("identity_usernames", None)
+            if changed:
+                conn.execute(
+                    "UPDATE licenses SET meta=? WHERE id=?",
+                    (json.dumps(meta), license_id),
+                )
+                deleted["license_meta"] += 1
+
+        if username:
+            import hashlib
+            import hmac
+            secret = os.getenv("LICENSE_HMAC_SECRET", "CHANGE_ME_DEV_SECRET").encode("utf-8")
+            trial_hash = "HMAC256:" + hmac.new(
+                secret, username.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            cur = conn.execute(
+                "DELETE FROM trials WHERE hash_type='ebay' AND hash_value=?", (trial_hash,)
+            )
+            deleted["trials"] = max(0, cur.rowcount)
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return deleted
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TOKENS
 # ─────────────────────────────────────────────────────────────────────────────
