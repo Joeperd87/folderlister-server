@@ -186,6 +186,14 @@ API_HOST  = {"PROD": "https://api.ebay.com", "SANDBOX": "https://api.sandbox.eba
 IDENTITY_HOST = API_HOST
 TRADING_ENDPOINT = {"PROD": "https://api.ebay.com/ws/api.dll", "SANDBOX": "https://api.sandbox.ebay.com/ws/api.dll"}
 
+# Media API -- opvolger van UploadSiteHostedPictures, dat eBay op 30-09-2026 uitzet.
+# Let op: createImageFromFile bestaat NIET in sandbox. eBay's aankondigingsmail zegt
+# "valideer in sandbox", de documentatie van de methode zelf zegt "not supported in
+# Sandbox environment". Er is dus geen sandbox-pad; testen gaat via de canary
+# (JOEP_EPS_MEDIA_CANARY) op een echte licentie in productie.
+MEDIA_HOST = {"PROD": "https://apim.ebay.com", "SANDBOX": "https://apim.sandbox.ebay.com"}
+MEDIA_BASE = "/commerce/media/v1_beta"
+
 MARKETPLACE_ID = {
     "UK": "EBAY_GB","GB": "EBAY_GB",
     "NL": "EBAY_NL","US": "EBAY_US","DE": "EBAY_DE","FR":"EBAY_FR","IT":"EBAY_IT",
@@ -197,14 +205,37 @@ TRADING_SITE_ID = {
     "ES":"186","IE":"205","BE":"123","AT":"16","AU":"15","CA":"2","PL":"212","CH":"193",
 }
 
+# De Media API vraagt sell.inventory. Een refresh_token kan zijn scopes niet
+# verbreden -- je krijgt terug wat de klant destijds heeft goedgekeurd. Iedereen
+# die vóór deze regel koppelde moet dus één keer opnieuw door het toestemmings-
+# scherm. Zie _has_media_scope() en /oauth/status -> needs_reconsent.
+MEDIA_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.inventory"
+
 USER_SCOPES = [
     "https://api.ebay.com/oauth/api_scope",  # Trading IAF
     "https://api.ebay.com/oauth/api_scope/sell.account.readonly",
     "https://api.ebay.com/oauth/api_scope/sell.stores.readonly",
     "https://api.ebay.com/oauth/api_scope/commerce.identity.readonly",  # <-- nodig voor /commerce/identity/v1/user
+    MEDIA_SCOPE,  # <-- nodig voor de Media API (foto-upload)
 ]
 USER_SCOPE_STR = " ".join(USER_SCOPES)
 APP_SCOPE_STR  = "https://api.ebay.com/oauth/api_scope"
+
+
+def _token_scopes(src: Dict[str, Any] | None) -> List[str]:
+    """De scopes die bij het minten van dit token zijn gevraagd.
+
+    eBay echoot de scope niet terug in de token-respons, dus bewaren we bij het
+    opslaan wat wij hebben gevraagd. Tokens van vóór deze wijziging missen het
+    veld; die gelden terecht als 'oud' en dus als zonder sell.inventory.
+    """
+    return str((src or {}).get("scopes") or "").split()
+
+
+def _has_media_scope(src: Dict[str, Any] | None) -> bool:
+    """Mag dit token de Media API gebruiken?"""
+    return MEDIA_SCOPE in _token_scopes(src)
+
 
 # ---- eBay marketplace → site code mapping
 _SITE_FROM_MARKETPLACE = {
@@ -1009,7 +1040,7 @@ async def ebay_account_deletion_notification(request: Request):
 def _set_user_token(env: str, access_token: str, refresh_token: Optional[str], expires_in: int) -> None:
     with _TOKENS_LOCK:
         tk = _tokens()
-        tk["user"] = {"env": env.upper(), "access_token": access_token, "refresh_token": refresh_token, "expires_at": _now() + int(expires_in)}
+        tk["user"] = {"env": env.upper(), "access_token": access_token, "refresh_token": refresh_token, "expires_at": _now() + int(expires_in), "scopes": USER_SCOPE_STR}
         _save_tokens(tk)
 
 def _set_user_token_ctx(ctx: str, env: str, access_token: str, refresh_token: Optional[str], expires_in: int, ebay_user: str | None = None, site: str | None = None, currency: str | None = None) -> None:
@@ -1031,6 +1062,7 @@ def _set_user_token_ctx(ctx: str, env: str, access_token: str, refresh_token: Op
                 "ebay_user": ebay_user,
                 "site": site,
                 "currency": currency,
+                "scopes": USER_SCOPE_STR,
                 "set_at": _now(),
             }
             tk["contexts"] = contexts
@@ -1061,7 +1093,8 @@ def _get_user() -> dict:
             return {"env": c.get("env") or "PROD",
                     "access_token": c.get("access_token"),
                     "refresh_token": c.get("refresh_token"),
-                    "expires_at": c.get("expires_at", 0)}
+                    "expires_at": c.get("expires_at", 0),
+                    "scopes": c.get("scopes") or ""}
         # 2. License-key prefix match — handles session ID mismatches (e.g. client
         #    restarted and got a new session ID but same license key).
         #    This NEVER crosses license keys, so it is safe for multi-user setups.
@@ -1072,7 +1105,8 @@ def _get_user() -> dict:
                     return {"env": _cv.get("env") or "PROD",
                             "access_token": _cv.get("access_token"),
                             "refresh_token": _cv.get("refresh_token"),
-                            "expires_at": _cv.get("expires_at", 0)}
+                            "expires_at": _cv.get("expires_at", 0),
+                            "scopes": _cv.get("scopes") or ""}
     # 3. Global fallback — only reached when there is no license key at all
     #    (single-user / legacy mode).  In multi-user setups this slot is no
     #    longer updated, so returning it here is safe.
@@ -1224,13 +1258,41 @@ def oauth_status():
             "authenticated": False,   # ← toegevoegd
             "expires_at": None,
             "has_refresh": False,
+            "needs_reconsent": False,
         }
+    # needs_reconsent: gekoppeld vóór de Media API-migratie. De koppeling werkt
+    # nog, maar mist sell.inventory en dus straks het foto-uploaden.
+    needs_reconsent = not _has_media_scope(u)
+
+    # Forceerknop voor de migratie. Staat standaard UIT.
+    #
+    # Zet JOEP_FORCE_RECONSENT=1 als je iedereen wilt dwingen opnieuw te koppelen
+    # vóór eBay op 30-09-2026 UploadSiteHostedPictures uitzet. De client krijgt
+    # dan dezelfde vorm als "niet ingelogd": elke bestaande build laat het
+    # statusbolletje op rood springen en de loginknop gloeien, en die knop start
+    # /oauth/start -- inmiddels mét sell.inventory. Zo bereik je iedereen zonder
+    # nieuwe release, ook wie nooit updatet.
+    #
+    # Het ziet er voor de klant uit als een onverwachte uitlog, dus zet dit pas
+    # aan als de aankondiging eruit is.
+    if needs_reconsent and (os.getenv("JOEP_FORCE_RECONSENT") or "").strip() in ("1", "true", "yes"):
+        return {
+            "env": u.get("env"),
+            "connected": False,
+            "authenticated": False,
+            "expires_at": u.get("expires_at"),
+            "has_refresh": bool(u.get("refresh_token")),
+            "needs_reconsent": True,
+            "reconsent_reason": "media_api_scope",
+        }
+
     return {
         "env": u.get("env"),
         "connected": True,
         "authenticated": True,       # ← toegevoegd
         "expires_at": u.get("expires_at"),
         "has_refresh": bool(u.get("refresh_token")),
+        "needs_reconsent": needs_reconsent,
     }
 
 
@@ -2708,6 +2770,183 @@ def _eps_upload_trading(env: str, site_code: str, filename: str, content: bytes,
 
 
 
+def _media_pick_url(d: Dict[str, Any]) -> str:
+    """Kies de grootste variant uit een Media API-antwoord.
+
+    De Media API geeft twee URL's terug voor dezelfde foto. Gemeten op
+    27-08-2026 met een 900x900 upload:
+
+        imageUrl             -> $_1.JPG   =  400x400  (verkleind)
+        maxDimensionImageUrl -> $_57.JPG  =  900x900  (het origineel)
+
+    imageUrl is dus NIET de opvolger van het oude <FullURL>; die gaf het
+    origineel. Erger nog: 400px zit onder eBay's eigen ondergrens van 500,
+    precies wat _ensure_min_longest_side_500() hierboven juist afdwingt.
+    _normalize_ebayimg_url() repareert het ook niet, want dat werkt op
+    /s-l###-patronen en niet op deze $_1.JPG-vorm.
+
+    Dus: maxDimensionImageUrl voorop, imageUrl als terugval.
+    """
+    if not isinstance(d, dict):
+        return ""
+    for key in ("maxDimensionImageUrl", "imageUrl"):
+        v = str(d.get(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _eps_upload_media_api(env: str, filename: str, content: bytes, *, timeout: int = 60) -> tuple[list[str], Dict[str, Any]]:
+    """Upload één foto via de Media API. Opvolger van _eps_upload_trading().
+
+    eBay documenteert dit als twee stappen:
+      1. POST .../image/create_image_from_file  (multipart, veldnaam "image")
+         -> 201 Created, met de image-URI in de Location-header
+      2. GET  .../image/{image_id}
+         -> ImageResponse met de EPS-URL die in <PictureURL> mag
+
+    Stap 2 slaan we over als stap 1 de URL al in de body meestuurt: de
+    documentatie noemt ImageResponse bij Types, maar wijst voor de bruikbare URL
+    naar de Location-route. Beide paden zijn hier afgedekt, want welke van de
+    twee het wordt is niet uit de documentatie op te maken.
+
+    De marktcode speelt hier geen rol meer -- de Media API kent geen SiteID- of
+    marketplace-header, EPS-beelden zijn marktonafhankelijk.
+
+    Geeft terug: ([url], meta) waarbij meta image_id en expiration_date bevat.
+    """
+    import time as _time
+
+    _refresh_user_if_needed()
+    u = _need_user(env)
+    if not _has_media_scope(u):
+        raise HTTPException(
+            403,
+            "ebay_reconsent_required: this eBay connection was made before the "
+            "Media API migration and lacks the sell.inventory scope. Reconnect "
+            "the eBay account to keep uploading pictures.",
+        )
+
+    base = MEDIA_HOST.get((env or "PROD").upper(), MEDIA_HOST["PROD"]) + MEDIA_BASE
+    headers = {"Authorization": f"Bearer {u['access_token']}", "Accept": "application/json"}
+    files = {"image": (filename or "image.jpg", content, "application/octet-stream")}
+
+    # Zelfde 429-aanpak als het Trading-pad. De Media API staat 50 POST's per 5s
+    # per gebruiker toe en de app uploadt sequentieel in één thread, dus dit is
+    # een vangnet en geen normaal pad.
+    r = None
+    for _attempt in range(4):
+        if _attempt > 0:
+            _wait = 5 * (2 ** (_attempt - 1))  # 5s, 10s, 20s
+            print(f"[MEDIA] 429 rate-limited by eBay, retrying in {_wait}s (attempt {_attempt+1}/4)")
+            _time.sleep(_wait)
+        r = requests.post(base + "/image/create_image_from_file", headers=headers, files=files, timeout=timeout)
+        if r.status_code != 429:
+            break
+
+    if r.status_code in (401, 403):
+        raise HTTPException(
+            r.status_code,
+            "ebay_reconsent_required: Media API refused the upload -- reconnect "
+            f"the eBay account. {r.text[:300]}",
+        )
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"Media API upload HTTP error: {r.text[:400]}")
+
+    try:
+        body = r.json() or {}
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    url = _media_pick_url(body)
+    expiration = str(body.get("expirationDate") or "").strip()
+
+    image_id = ""
+    loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
+    if loc:
+        image_id = loc.rstrip("/").rsplit("/", 1)[-1].strip()
+    if not image_id:
+        image_id = str(body.get("imageId") or "").strip()
+
+    if not url:
+        if not image_id:
+            raise HTTPException(502, f"Media API: no imageUrl and no Location header. Raw: {r.text[:400]}")
+        g = requests.get(f"{base}/image/{quote(image_id)}", headers=headers, timeout=timeout)
+        if g.status_code >= 400:
+            raise HTTPException(502, f"Media API getImage failed ({g.status_code}): {g.text[:400]}")
+        try:
+            gj = g.json() or {}
+        except Exception:
+            gj = {}
+        if isinstance(gj, dict):
+            url = _media_pick_url(gj)
+            expiration = str(gj.get("expirationDate") or expiration or "").strip()
+            body = gj  # voor de diagnostiek hieronder
+
+    if not url:
+        raise HTTPException(502, f"Media API: image created but no imageUrl returned (id={image_id or '?'}).")
+
+    return [url], {
+        "image_id": image_id or None,
+        "expiration_date": expiration or None,
+        # Bewust niet allebei in all_urls: dat zou dezelfde foto twee keer in
+        # de listing zetten. Alleen ter diagnose.
+        "image_url_small": str(body.get("imageUrl") or "").strip() or None,
+        "image_url_max": str(body.get("maxDimensionImageUrl") or "").strip() or None,
+    }
+
+
+def _eps_backend_for(license_key: str = "") -> str:
+    """Welke uploadroute geldt hier: 'trading', 'media' of 'auto'?
+
+    JOEP_EPS_BACKEND      'trading' (standaard) | 'media' | 'auto'
+                          auto = Media API proberen, bij fout terugvallen op
+                          Trading zolang die nog bestaat (tot 30-09-2026).
+    JOEP_EPS_MEDIA_CANARY komma-lijst met licentiesleutels die altijd 'media'
+                          krijgen. Zo test je de nieuwe route in productie op je
+                          eigen sleutel zonder één klant te raken.
+    """
+    canary = {s.strip() for s in (os.getenv("JOEP_EPS_MEDIA_CANARY") or "").split(",") if s.strip()}
+    if license_key and license_key.strip() in canary:
+        return "media"
+    mode = (os.getenv("JOEP_EPS_BACKEND") or "trading").strip().lower()
+    return mode if mode in ("trading", "media", "auto") else "trading"
+
+
+def _eps_upload(env: str, site_code: str, filename: str, content: bytes,
+                picture_name: str | None = None, license_key: str = "") -> tuple[list[str], Dict[str, Any]]:
+    """Upload één foto naar EPS via de route die voor deze licentie geldt."""
+    mode = _eps_backend_for(license_key)
+
+    if mode == "trading":
+        return _eps_upload_trading(env, site_code, filename, content, picture_name), {"backend": "trading"}
+
+    if mode == "auto":
+        # Nog niet opnieuw gekoppeld? Dan heeft de Media API geen zin en werkt
+        # Trading nog gewoon. Niet hard falen: de nudge om opnieuw te koppelen
+        # loopt via /oauth/status, niet via een kapotte upload.
+        try:
+            _refresh_user_if_needed()
+            if not _has_media_scope(_need_user(env)):
+                return (_eps_upload_trading(env, site_code, filename, content, picture_name),
+                        {"backend": "trading", "reason": "no_media_scope"})
+        except HTTPException:
+            pass
+
+    try:
+        urls, meta = _eps_upload_media_api(env, filename, content)
+        meta["backend"] = "media"
+        return urls, meta
+    except HTTPException as e:
+        if mode != "auto":
+            raise
+        print(f"[EPS] media backend failed ({e.status_code}), falling back to Trading: {str(e.detail)[:200]}")
+        urls = _eps_upload_trading(env, site_code, filename, content, picture_name)
+        return urls, {"backend": "trading-fallback", "media_error": str(e.detail)[:200]}
+
+
 from typing import Optional
 from fastapi import Request, HTTPException, Query, UploadFile, File
 import requests
@@ -2903,7 +3142,7 @@ async def media_eps_upload(
     except Exception as _e:
         image_meta = {"error": str(_e)}
 
-    urls = _eps_upload_trading(env, site, upload_name, content, picture_name)
+    urls, upload_meta = _eps_upload(env, site, upload_name, content, picture_name, license_key=lk)
 
     # Charge the quota only after a confirmed successful upload — charging
     # before this call meant a failed/timed-out attempt (auth hiccup, eBay
@@ -2931,6 +3170,10 @@ async def media_eps_upload(
         "eps_used_today": eps_used,
         "eps_remaining_today": eps_remaining,
         "image_meta": image_meta,
+        # Additief; oudere clients negeren onbekende velden.
+        "image_id": upload_meta.get("image_id"),
+        "expires_at": upload_meta.get("expiration_date"),
+        "upload_backend": upload_meta.get("backend"),
     }
 
 
