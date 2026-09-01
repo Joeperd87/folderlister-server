@@ -5677,7 +5677,79 @@ def web_publish(request: Request, payload: Dict[str, Any] = Body(...)):
 
     results = []
 
-    for row in rows:
+    # --- Preflight: validate every row before any (slow) Trading API call ---
+    # AddFixedPriceItem/ReviseFixedPriceItem for a listing with many variations
+    # can take a long time, and a publish batch can contain many rows. Without
+    # this, a row with a real problem (>250 variations, a variation with no
+    # price, or duplicate variation specifics) only surfaces its error after
+    # every row ahead of it in the batch has already gone through that slow
+    # call. Check all rows up front instead, so every problem in the whole
+    # batch is visible before the first eBay call starts.
+    import json as _json
+    from collections import defaultdict as _dd
+
+    def _pf_price(v: Dict[str, Any]) -> float:
+        try:
+            raw = v.get("start_price")
+            if raw is None or raw == "":
+                raw = v.get("price")
+            if raw is None or raw == "":
+                return 0.0
+            return float(raw)
+        except Exception:
+            return 0.0
+
+    _preflight_errors: Dict[int, str] = {}
+    for _pf_idx, _pf_row in enumerate(rows):
+        _pf_vars = _pf_row.get("variations") or []
+        if not isinstance(_pf_vars, list) or not _pf_vars:
+            continue
+
+        if len(_pf_vars) > 250:
+            _preflight_errors[_pf_idx] = (
+                f"eBay allows at most 250 variations per listing, this listing has {len(_pf_vars)}."
+            )
+            continue
+
+        _no_price = [
+            str(v.get("sku") or f"variation {i + 1}")
+            for i, v in enumerate(_pf_vars)
+            if _pf_price(v) <= 0.0
+        ]
+        if _no_price:
+            _shown = ", ".join(_no_price[:10])
+            _more = f", +{len(_no_price) - 10} more" if len(_no_price) > 10 else ""
+            _preflight_errors[_pf_idx] = f"{len(_no_price)} variation(s) have no price: {_shown}{_more}"
+            continue
+
+        _spec_groups = _dd(list)
+        for _vi, _vv in enumerate(_pf_vars):
+            _specs = _vv.get("specifics") or {}
+            _key = _json.dumps(_specs, sort_keys=True)
+            _spec_groups[_key].append({"index": _vi, "sku": str(_vv.get("sku") or "")})
+        _dupes = {k: v for k, v in _spec_groups.items() if len(v) > 1}
+        if _dupes:
+            _msgs = []
+            for _key, _dup_rows in _dupes.items():
+                _specs_display = _json.loads(_key)
+                _row_list = ", ".join(
+                    f"row {r['index'] + 1} (SKU: {r['sku']})".strip() for r in _dup_rows
+                )
+                _msgs.append(f"Duplicate variation specifics {_specs_display} on {_row_list}")
+            _preflight_errors[_pf_idx] = (
+                "Duplicate variation specifics found — fix before publishing:\n" + "\n".join(_msgs)
+            )
+    # --- end preflight ---
+
+    for _row_idx, row in enumerate(rows):
+        if _row_idx in _preflight_errors:
+            results.append({
+                "title": row.get("title"),
+                "ok": False,
+                "error": _preflight_errors[_row_idx],
+            })
+            continue
+
         # per row → rows_builder vult 'site_code' in
         row_site = (str(row.get("site_code") or "").strip().upper() or None)
 
@@ -5736,32 +5808,6 @@ def web_publish(request: Request, payload: Dict[str, Any] = Body(...)):
             # variations only supported on fixed-price listings; keep UI consistent
             row["format"] = "Fixed price"
         row_tz = row.get("timezone") or row.get("tz") or payload_tz
-
-        # --- duplicate variation-specifics check (error 21916586 prevention) ---
-        if has_vars:
-            import json as _json
-            from collections import defaultdict as _dd
-            _spec_groups = _dd(list)
-            for _vi, _vv in enumerate(row.get("variations") or []):
-                _specs = _vv.get("specifics") or {}
-                _key = _json.dumps(_specs, sort_keys=True)
-                _spec_groups[_key].append({"index": _vi, "sku": str(_vv.get("sku") or "")})
-            _dupes = {k: v for k, v in _spec_groups.items() if len(v) > 1}
-            if _dupes:
-                _msgs = []
-                for _key, _rows in _dupes.items():
-                    _specs_display = _json.loads(_key)
-                    _row_list = ", ".join(
-                        f"row {r['index']+1} (SKU: {r['sku']})".strip() for r in _rows
-                    )
-                    _msgs.append(f"Duplicate variation specifics {_specs_display} on {_row_list}")
-                results.append({
-                    "title": row.get("title"),
-                    "ok": False,
-                    "error": "Duplicate variation specifics found — fix before publishing:\n" + "\n".join(_msgs),
-                })
-                continue
-        # --- end duplicate check ---
 
         try:
             _has_item_id = bool(str(row.get("item_id") or "").strip())

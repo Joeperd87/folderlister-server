@@ -3,6 +3,7 @@
 server/.env
 *.json
 !server/requirements.txt
+!server/scheeltwerk_intake_catalog.json
 !.claude/settings.json
 
 # Backups

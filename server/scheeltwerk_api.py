@@ -2,7 +2,7 @@
 # Separate from Folderlister. Mounted as a router in app.py.
 
 from __future__ import annotations
-import os, json, time, re, uuid
+import os, json, time, re, uuid, html
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 import requests as http_requests
@@ -553,3 +553,309 @@ async def scheeltwerk_mail_uitwerking(request: Request, background_tasks: Backgr
     background_tasks.add_task(_send_scan_emails_bg, result, domain, url, email, naam)
 
     return {"ok": True, "domain": domain}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# PRIJPAGINA INTAKEHULP
+# ───────────────────────────────────────────────────────────────────────────
+
+_INTAKE_CATALOG: Optional[Dict[str, Any]] = None
+
+
+def _load_intake_catalog() -> Dict[str, Any]:
+    """Load the controlled ScheeltWerk possibilities catalog once per worker."""
+    global _INTAKE_CATALOG
+    if _INTAKE_CATALOG is not None:
+        return _INTAKE_CATALOG
+    path = os.path.join(os.path.dirname(__file__), "scheeltwerk_intake_catalog.json")
+    try:
+        with open(path, "r", encoding="utf-8") as catalog_file:
+            loaded = json.load(catalog_file)
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("categories"), list):
+            raise ValueError("invalid catalog")
+        _INTAKE_CATALOG = loaded
+    except Exception:
+        _INTAKE_CATALOG = {"categories": []}
+    return _INTAKE_CATALOG
+
+
+def _intake_items() -> Dict[str, Dict[str, Any]]:
+    items: Dict[str, Dict[str, Any]] = {}
+    for category in _load_intake_catalog().get("categories") or []:
+        category_title = str(category.get("title") or "")
+        for item in category.get("items") or []:
+            item_id = str(item.get("id") or "").strip()
+            if not item_id:
+                continue
+            items[item_id] = {
+                "id": item_id,
+                "title": str(item.get("title") or ""),
+                "benefit": str(item.get("benefit") or ""),
+                "control": str(item.get("control") or ""),
+                "tags": [str(tag) for tag in (item.get("tags") or [])][:12],
+                "category": category_title,
+            }
+    return items
+
+
+def _intake_catalog_prompt() -> str:
+    """Keep the model grounded in the small, verified options catalog."""
+    compact = []
+    for item in _intake_items().values():
+        compact.append({
+            "id": item["id"],
+            "titel": item["title"],
+            "categorie": item["category"],
+            "tags": item["tags"],
+        })
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+
+
+_INTAKE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string"},
+        "summary": {"type": "string"},
+        "suggestion_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+        "question": {"type": "string"},
+        "answer_options": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+        "can_submit": {"type": "boolean"},
+        "needs_connection_check": {"type": "boolean"},
+        "lookup_program": {"type": "string"},
+        "lookup_goal": {"type": "string"},
+    },
+    "required": [
+        "reply", "summary", "suggestion_ids", "question", "answer_options",
+        "can_submit", "needs_connection_check", "lookup_program", "lookup_goal",
+    ],
+    "additionalProperties": False,
+}
+
+
+_INTAKE_SYSTEM = """Je bent de rustige intakehulp van ScheeltWerk, van Joep Litjens.
+
+Je praat nuchter Nederlands, direct en behulpzaam. De bezoeker is koning: hij kan altijd stoppen of zijn vraag doorsturen. Je bent geen verkoper en geen technische chatbot.
+
+Doel: begrijp welk terugkerend handwerk, zoekwerk, overtypen of wachten de bezoeker wil verminderen. Kies alleen uit de gecontroleerde catalogus hieronder. Geef maximaal drie suggestie-id's. Stel maximaal één vraag tegelijk en alleen als die een prijsinschatting duidelijker maakt. Na twee tot vier bruikbare antwoorden zet je can_submit op true en nodig je rustig uit om Joep vrijblijvend mee te laten kijken.
+
+Zeg geen definitieve prijs, doorlooptijd of gegarandeerde koppeling. Gebruik geen API-, workflow- of architectuurtaal tenzij de bezoeker zelf over koppelen of een API begint. Bij betalingen, boekingen, klantcommunicatie, offertes, ERP, planning, productie, publiceren of verwijderen noem je kort dat een medewerker controleert of goedkeurt.
+
+Als iemand een concreet programma noemt EN vraagt of een koppeling of gegevensuitwisseling mogelijk is, zet needs_connection_check op true met de programmanaam en het doel. Anders false met lege strings. De aparte officiële controle doet de server; doe zelf geen feitelijke bewering over die koppeling.
+
+Gebruik geen marketingtaal. Zinnen die passen: "Dat zou werk kunnen schelen.", "Ik kijk even welke route hierbij past.", "Dat moet nog even worden gecontroleerd."
+
+Gecontroleerde catalogus: """
+
+
+def _run_intake_ai(message: str, history: list, selected_ids: list) -> Dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(503, detail={"message": "De hulp is nu even niet beschikbaar."})
+    try:
+        from openai import OpenAI as _OpenAI
+    except ImportError:
+        raise HTTPException(503, detail={"message": "De hulp is nu even niet beschikbaar."})
+
+    clean_history = []
+    for entry in history[-8:]:
+        if not isinstance(entry, dict):
+            continue
+        role = "Bezoeker" if entry.get("role") == "visitor" else "Hulp"
+        content = str(entry.get("content") or "").strip()[:1200]
+        if content:
+            clean_history.append(f"{role}: {content}")
+    selected = [item_id for item_id in selected_ids if item_id in _intake_items()][:8]
+    prompt = (
+        _INTAKE_SYSTEM + _intake_catalog_prompt() +
+        "\n\nGesprek tot nu toe:\n" + ("\n".join(clean_history) or "(nieuw gesprek)") +
+        "\n\nBezoeker zegt nu:\n" + message +
+        "\n\nEerder gekozen mogelijkheden:\n" + (", ".join(selected) or "geen")
+    )
+    try:
+        client = _OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.getenv("SCHEELTWERK_INTAKE_MODEL", "gpt-4.1-mini"),
+            messages=[
+                {"role": "system", "content": "Geef uitsluitend JSON volgens het schema."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "scheeltwerk_intake_reply", "strict": True, "schema": _INTAKE_SCHEMA},
+            },
+            temperature=0.2,
+        )
+        return json.loads(response.choices[0].message.content or "{}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, detail={"message": f"De hulp kan nu niet meedenken: {str(exc)[:120]}"})
+
+
+_CONNECTION_LOOKUP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string"},
+        "found_official_route": {"type": "boolean"},
+        "source_url": {"type": "string"},
+        "source_label": {"type": "string"},
+    },
+    "required": ["reply", "found_official_route", "source_url", "source_label"],
+    "additionalProperties": False,
+}
+
+
+def _run_official_connection_check(program: str, goal: str) -> Dict[str, Any]:
+    """Use web search only to find a first-party API/import/export route."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {}
+    try:
+        from openai import OpenAI as _OpenAI
+        client = _OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=os.getenv("SCHEELTWERK_INTAKE_LOOKUP_MODEL", "gpt-4.1-mini"),
+            tools=[{"type": "web_search", "search_context_size": "low"}],
+            input=(
+                "Zoek alleen op de officiële website, helpomgeving of ontwikkelaarsdocumentatie van "
+                f"{program}. Onderzoek alleen of er een officiële API, import, export of integratie "
+                f"bestaat voor deze wens: {goal}. Gebruik geen blogs, forums of partners als bron. "
+                "Geef een kort, nuchter Nederlands antwoord. Als je geen officiële route kunt bevestigen, "
+                "zeg dat eerlijk. Zeg nooit dat een koppeling gegarandeerd werkt. "
+                "Begin het antwoord met 'Ik heb even op de officiële website gekeken.' of, als geen bron "
+                "bevestigd is, 'Ik heb even gezocht naar een officiële route.'"
+            ),
+            text={"format": {"type": "json_schema", "name": "scheeltwerk_connection_check", "strict": True, "schema": _CONNECTION_LOOKUP_SCHEMA}},
+            store=False,
+        )
+        result = json.loads(response.output_text or "{}")
+        if not re.match(r"^https://", str(result.get("source_url") or ""), flags=re.IGNORECASE):
+            result["source_url"] = ""
+            result["source_label"] = ""
+        return result
+    except Exception:
+        return {
+            "reply": "Ik kon de officiële koppelingsroute nu niet goed controleren. Joep kan dit nog gericht voor je nakijken.",
+            "found_official_route": False,
+            "source_url": "",
+            "source_label": "",
+        }
+
+
+def _intake_rate_limit(request: Request, log_type: str, limit: int) -> str:
+    ip_key = fingerprint(_client_ip(request))
+    try:
+        conn = _db.get_conn()
+        hour_ago = time.time() - 3600
+        count = conn.execute(
+            "SELECT COUNT(*) FROM request_log WHERE log_type=? AND ts>? AND meta LIKE ?",
+            (log_type, hour_ago, f"%{ip_key}%"),
+        ).fetchone()[0]
+        if count >= limit:
+            raise HTTPException(429, detail={"message": "Je hebt de hulp net al vaak gebruikt. Stuur je vraag gerust door, dan kijkt Joep ernaar."})
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    return ip_key
+
+
+@router.post("/intake-assistant")
+async def scheeltwerk_intake_assistant(request: Request):
+    """One short, catalog-bound reply for the price-page intake helper."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail={"message": "Ongeldige aanvraag."})
+    message = str(body.get("message") or "").strip()
+    if not message or len(message) > 3000:
+        raise HTTPException(400, detail={"message": "Beschrijf in één of een paar zinnen wat je wilt automatiseren."})
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    selected_ids = body.get("selected_suggestions") if isinstance(body.get("selected_suggestions"), list) else []
+    ip_key = _intake_rate_limit(request, "scheeltwerk_intake_reply", 20)
+    result = _run_intake_ai(message, history, selected_ids)
+    items = _intake_items()
+    suggestion_ids = []
+    for item_id in result.get("suggestion_ids") or []:
+        if item_id in items and item_id not in suggestion_ids:
+            suggestion_ids.append(item_id)
+    suggestions = [items[item_id] for item_id in suggestion_ids[:3]]
+    connection_check = None
+    if result.get("needs_connection_check") and str(result.get("lookup_program") or "").strip():
+        connection_check = _run_official_connection_check(
+            str(result.get("lookup_program") or "").strip()[:160],
+            str(result.get("lookup_goal") or message).strip()[:700],
+        )
+    _db.log_event("scheeltwerk_intake_reply", ip_hash=ip_key, meta={
+        "ip_key": ip_key, "selected": suggestion_ids, "connection_check": bool(connection_check),
+    })
+    return {
+        "ok": True,
+        "reply": str(result.get("reply") or ""),
+        "summary": str(result.get("summary") or message)[:1800],
+        "suggestions": suggestions,
+        "question": str(result.get("question") or ""),
+        "answer_options": [str(option)[:140] for option in (result.get("answer_options") or [])[:3]],
+        "can_submit": bool(result.get("can_submit")),
+        "connection_check": connection_check,
+    }
+
+
+@router.post("/intake-versturen")
+async def scheeltwerk_intake_versturen(request: Request):
+    """Mail the human-readable intake summary to Joep and the visitor."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, detail={"message": "Ongeldige aanvraag."})
+    email = str(body.get("email") or "").strip()
+    summary = str(body.get("summary") or "").strip()
+    if not email or "@" not in email or not summary:
+        raise HTTPException(400, detail={"message": "E-mailadres en omschrijving zijn nodig om je vraag door te sturen."})
+    if len(summary) > 2200:
+        raise HTTPException(400, detail={"message": "Je omschrijving is te lang. Maak hem iets korter en probeer opnieuw."})
+    ip_key = _intake_rate_limit(request, "scheeltwerk_intake_sent", 8)
+    name = str(body.get("naam") or "").strip()[:160]
+    company = str(body.get("bedrijf") or "").strip()[:160]
+    selected_ids = body.get("selected_suggestions") if isinstance(body.get("selected_suggestions"), list) else []
+    items = _intake_items()
+    selected_titles = [items[item_id]["title"] for item_id in selected_ids if item_id in items][:8]
+    checks = body.get("connection_checks") if isinstance(body.get("connection_checks"), list) else []
+    safe_summary = html.escape(summary).replace("\n", "<br>")
+    safe_checks = []
+    for check in checks[:3]:
+        if not isinstance(check, dict):
+            continue
+        reply = html.escape(str(check.get("reply") or ""))
+        source = str(check.get("source_url") or "").strip()
+        if re.match(r"^https://", source, flags=re.IGNORECASE):
+            label = html.escape(str(check.get("source_label") or "officiële documentatie"))
+            reply += f' <a href="{html.escape(source, quote=True)}">{label}</a>'
+        if reply:
+            safe_checks.append(f"<li>{reply}</li>")
+    checks_html = "<ul>" + "".join(safe_checks) + "</ul>" if safe_checks else "-"
+    _db.log_event("scheeltwerk_intake_sent", ip_hash=ip_key, meta={
+        "ip_key": ip_key, "email_key": fingerprint(email.lower()), "selected": selected_titles, "company": company,
+    })
+    _resend_mail(
+        to="joep@scheeltwerk.nl",
+        subject=f"Nieuwe prijsinschatting: {name or email} ({company or 'geen bedrijf'})",
+        html=f"""<h2>Nieuwe vrijblijvende prijsinschatting via scheeltwerk.nl</h2>
+<p><strong>Naam:</strong> {html.escape(name or '-')}<br>
+<strong>E-mail:</strong> {html.escape(email)}<br>
+<strong>Bedrijf:</strong> {html.escape(company or '-')}</p>
+<p><strong>Samenvatting:</strong><br>{safe_summary}</p>
+<p><strong>Gekozen richtingen:</strong><br>{html.escape(', '.join(selected_titles) or '-')}</p>
+<p><strong>Officiële koppelingschecks:</strong><br>{checks_html}</p>""",
+    )
+    greeting = f", {html.escape(name)}" if name else ""
+    _resend_mail(
+        to=email,
+        subject="Je vraag voor een prijsinschatting is ontvangen — ScheeltWerk",
+        html=f"""<div style="font-family:sans-serif;max-width:560px;margin:0 auto;color:#1a1d21">
+<h2 style="color:#e07830">Bedankt{greeting}.</h2>
+<p>Ik heb je vraag ontvangen. Ik kijk wat een logische eerste stap is en stuur je binnen enkele dagen een vrijblijvende inschatting.</p>
+<p style="margin-top:24px;color:#4a5060;font-size:14px">— Joep Litjens<br>scheeltwerk.nl</p>
+</div>""",
+    )
+    return {"ok": True}

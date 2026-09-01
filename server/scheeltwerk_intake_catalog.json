@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "name": "ScheeltWerk mogelijkhedenbibliotheek",
+  "use": "Alleen als gecontroleerde basis voor de intakehulp. Toon maximaal drie passende mogelijkheden tegelijk.",
+  "categories": [
+    {
+      "id": "mailbox",
+      "title": "Mailbox en binnenkomend werk",
+      "items": [
+        {"id":"mail-sort","title":"Mails sorteren en labelen","benefit":"Zet binnenkomende mail direct bij het juiste onderwerp, team of type werk.","control":"Onduidelijke berichten blijven zichtbaar voor een medewerker.","tags":["mail","inbox","sorteren","label"]},
+        {"id":"mail-invoice","title":"Facturen herkennen","benefit":"Haal factuurmails uit de gewone inbox, zodat ze niet tussen klantvragen blijven staan.","control":"Twijfelgevallen worden niet automatisch als factuur behandeld.","tags":["mail","factuur","pdf","bijlage"]},
+        {"id":"mail-attachment","title":"Bijlagen opslaan en benoemen","benefit":"Bewaar documenten op de afgesproken plek met een herkenbare naam.","control":"Bestaande bestanden worden niet overschreven zonder afspraak.","tags":["mail","bijlage","bestand","opslaan"]},
+        {"id":"mail-task","title":"Van mail naar taak","benefit":"Maak van een aanvraag, storing of vraag meteen een taak die iemand kan oppakken.","control":"De medewerker kan taak, eigenaar en prioriteit aanpassen.","tags":["mail","taak","aanvraag","storing"]},
+        {"id":"mail-reply","title":"Antwoord voorbereiden","benefit":"Zet een concept klaar op basis van afgesproken informatie en toon.","control":"Een medewerker leest en verstuurt het bericht zelf.","tags":["mail","antwoord","klantvraag","concept"]}
+      ]
+    },
+    {
+      "id": "helpdesk",
+      "title": "Helpdesk en klantvragen",
+      "items": [
+        {"id":"helpdesk-route","title":"Klantvragen verdelen","benefit":"Zet vragen sneller bij de juiste persoon of het juiste team.","control":"Onduidelijke of gevoelige vragen gaan niet automatisch door.","tags":["helpdesk","klantvraag","ticket","verdelen"]},
+        {"id":"helpdesk-context","title":"Klant- of orderinformatie erbij zoeken","benefit":"Geef de behandelaar direct relevante context bij een nieuwe vraag.","control":"Alleen afgesproken klantgegevens worden getoond.","tags":["helpdesk","klant","order","context"]},
+        {"id":"helpdesk-draft","title":"Antwoordconcept uit goedgekeurde kennis","benefit":"Bereid een helder antwoord voor op veelgestelde vragen.","control":"Het antwoord blijft een concept en gebruikt alleen afgesproken bronnen.","tags":["helpdesk","kennisbank","antwoord","ai"]},
+        {"id":"helpdesk-ticket","title":"Ticket aanmaken en toewijzen","benefit":"Zet een klantvraag om in een taak met eigenaar en status.","control":"De toewijzing blijft aanpasbaar.","tags":["helpdesk","ticket","taak","status"]},
+        {"id":"helpdesk-dashboard","title":"Helpdeskoverzicht voor meerdere medewerkers","benefit":"Breng vragen, status, eigenaarschap en controles samen in één overzicht.","control":"Rollen en rechten bepalen wie wat kan zien of afhandelen.","tags":["helpdesk","dashboard","gebruikers","overzicht"]}
+      ]
+    },
+    {
+      "id": "boekhouding",
+      "title": "Facturen en boekhouding",
+      "items": [
+        {"id":"finance-extract","title":"Factuurgegevens uitlezen","benefit":"Zet leverancier, datum, bedrag en factuurnummer klaar zonder alles over te typen.","control":"Onleesbare of afwijkende documenten gaan naar een controlelijst.","tags":["factuur","boekhouding","pdf","uitlezen"]},
+        {"id":"finance-duplicate","title":"Dubbele facturen signaleren","benefit":"Maak mogelijke doublures zichtbaar voordat ze verder worden verwerkt.","control":"Niets wordt automatisch verwijderd.","tags":["factuur","dubbel","controle"]},
+        {"id":"finance-match","title":"Betaling en factuur naast elkaar leggen","benefit":"Bereid matches voor, zodat zoeken en vergelijken minder tijd kost.","control":"Matches blijven voorstellen en zijn geen automatische boeking.","tags":["bank","betaling","factuur","match"]},
+        {"id":"finance-queue","title":"Afwijkingen in een overzicht","benefit":"Laat alleen de regels zien die aandacht vragen.","control":"Het origineel blijft naast de gevonden gegevens beschikbaar.","tags":["factuur","overzicht","afwijking","controle"]},
+        {"id":"finance-export","title":"Gecontroleerde gegevens doorzetten","benefit":"Verminder dubbel invoerwerk na akkoord in het boekhoudpakket.","control":"Alleen na de afgesproken goedkeuring en als de route passend blijkt.","tags":["boekhouding","exact","export","koppeling"]}
+      ]
+    },
+    {
+      "id": "orders-erp",
+      "title": "Orders, ERP en productie",
+      "items": [
+        {"id":"order-recognize","title":"Ordermails en PDF's herkennen","benefit":"Haal bestellingen uit de mailbox voordat iemand ze handmatig moet overnemen.","control":"Onbekende mailtypen worden apart gehouden.","tags":["order","mail","pdf","erp"]},
+        {"id":"order-extract","title":"Ordergegevens klaarzetten","benefit":"Maak klant, artikel, aantallen en leverdatum controleklaar voor de volgende stap.","control":"Ontbrekende of onzekere waarden worden duidelijk gemarkeerd.","tags":["order","artikel","aantal","leverdatum"]},
+        {"id":"order-erp-draft","title":"Orderconcept voor het ERP","benefit":"Verminder overtypen tussen mailbox en ERP.","control":"Een medewerker vergelijkt het origineel met het concept en keurt goed.","tags":["order","erp","concept","koppeling"]},
+        {"id":"order-exception","title":"Afwijkende orders apart zetten","benefit":"Geef uitzonderingen, onbekende artikelen of afwijkende aantallen direct aandacht.","control":"De medewerker bepaalt de vervolgstap.","tags":["order","afwijking","controle"]},
+        {"id":"order-production","title":"Werk- of productieopdracht voorbereiden","benefit":"Zet goedgekeurde orderinformatie klaar voor uitvoering.","control":"Planning en productie volgen pas na menselijke controle.","tags":["productie","werkopdracht","planning","erp"]}
+      ]
+    },
+    {
+      "id": "planning",
+      "title": "Planning, afspraken en terugkerende taken",
+      "items": [
+        {"id":"planning-intake","title":"Aanvraag omzetten in een planningsitem","benefit":"Zet werk uit mail, formulier of telefoonnotitie direct klaar in de planning.","control":"Een medewerker bepaalt het definitieve moment.","tags":["planning","aanvraag","taak"]},
+        {"id":"planning-availability","title":"Beschikbaarheid vergelijken","benefit":"Maak mogelijke momenten zichtbaar zonder alles handmatig naast elkaar te leggen.","control":"Conflicten en uitzonderingen worden bevestigd door een medewerker.","tags":["planning","agenda","beschikbaarheid"]},
+        {"id":"planning-proposal","title":"Afspraken voorstellen","benefit":"Bereid mogelijke afspraakmomenten of een conceptbericht voor.","control":"Niets wordt verstuurd of vastgezet zonder akkoord.","tags":["planning","afspraak","agenda","mail"]},
+        {"id":"planning-board","title":"Planbord of dagoverzicht","benefit":"Geef een team één plek voor taken, status en afspraken.","control":"Rollen bepalen wie kan plannen, wijzigen of alleen kijken.","tags":["planning","dashboard","team","planbord"]},
+        {"id":"planning-reminder","title":"Terugkerend werk bewaken","benefit":"Zorg dat onderhoud, opvolging of periodiek werk niet wordt vergeten.","control":"Frequentie en ontvangers worden vooraf afgestemd.","tags":["planning","herinnering","onderhoud","opvolging"]}
+      ]
+    },
+    {
+      "id": "werkbonnen",
+      "title": "Werkbonnen, buitendienst en bouw/installatie",
+      "items": [
+        {"id":"field-workorder","title":"Digitale werkbon","benefit":"Leg werk direct op locatie vast in plaats van later alles over te typen.","control":"Verplichte velden en afsluiten van de werkbon worden ingesteld.","tags":["werkbon","monteur","buitendienst","tablet"]},
+        {"id":"field-photo","title":"Foto's aan de juiste klus koppelen","benefit":"Zorg dat bewijs, situatie en projectinformatie bij elkaar blijven.","control":"Onduidelijke koppelingen worden ter controle aangeboden.","tags":["foto","klus","project","werkbon"]},
+        {"id":"field-read","title":"Kenplaat, serienummer of meterstand uitlezen","benefit":"Haal bruikbare gegevens uit foto's voor de werkbon of het dossier.","control":"Onleesbare foto's of twijfel worden gemarkeerd.","tags":["foto","serienummer","meterstand","installatie"]},
+        {"id":"field-followup","title":"Vervolgwerk signaleren","benefit":"Zet een taak klaar wanneer de monteur extra werk of materiaal noteert.","control":"Een medewerker beoordeelt de opvolging.","tags":["werkbon","vervolgwerk","materiaal","taak"]},
+        {"id":"field-invoice","title":"Werkbon naar factuur voorbereiden","benefit":"Gebruik dezelfde vastgelegde gegevens voor een factuurconcept.","control":"Factuur, prijs en verzending worden goedgekeurd.","tags":["werkbon","factuur","uren","materiaal"]}
+      ]
+    },
+    {
+      "id": "verkoop",
+      "title": "Verkoop, aanvragen en offertes",
+      "items": [
+        {"id":"sales-collect","title":"Aanvragen verzamelen","benefit":"Laat nieuwe aanvragen niet over verschillende inboxen en formulieren verspreiden.","control":"Spam en twijfelgevallen worden apart gezet.","tags":["aanvraag","website","mail","lead"]},
+        {"id":"sales-extract","title":"Informatie uit een aanvraag halen","benefit":"Zet naam, locatie, soort werk en vraag overzichtelijk klaar.","control":"Ontbrekende gegevens blijven zichtbaar.","tags":["aanvraag","offerte","klant","informatie"]},
+        {"id":"sales-calculation","title":"Calculatie of offerte voorbereiden","benefit":"Gebruik gegevens uit een aanvraag om een calculatie of offerteconcept klaar te zetten.","control":"Bedragen, aannames en de definitieve offerte blijven eerst ter controle.","tags":["aanvraag","calculatie","offerte","prijs","mail"]},
+        {"id":"sales-followup","title":"Opvolgtaak maken","benefit":"Zorg dat een goede aanvraag niet stilvalt.","control":"Timing en eigenaar blijven aanpasbaar.","tags":["aanvraag","opvolging","taak","crm"]},
+        {"id":"sales-quote","title":"Antwoord- of offerteconcept","benefit":"Begin met de juiste klantinformatie en vaste teksten.","control":"Prijs, belofte en definitieve verzending zijn altijd menselijk werk.","tags":["offerte","antwoord","prijs","concept"]},
+        {"id":"sales-pipeline","title":"Verkooppipeline bijwerken","benefit":"Houd klant- en aanvraagstatus op één plek bij.","control":"Dubbele of onzekere klantmatches worden nagekeken.","tags":["crm","pipeline","lead","status"]}
+      ]
+    },
+    {
+      "id": "portalen",
+      "title": "Dashboards, portalen en interne tools",
+      "items": [
+        {"id":"portal-dashboard","title":"Overzicht van taken en statussen","benefit":"Geef een team zicht op wat nieuw is, wacht en klaar is.","control":"De betekenis van statussen wordt vooraf helder afgesproken.","tags":["dashboard","taak","status","overzicht"]},
+        {"id":"portal-queue","title":"Wachtrij voor controlewerk","benefit":"Laat alleen de gevallen zien waar een mens nodig is.","control":"De controleur ziet ook het origineel of de reden van twijfel.","tags":["controle","wachtrij","dashboard","goedkeuring"]},
+        {"id":"portal-login","title":"Inloggen voor verschillende gebruikers","benefit":"Geef medewerkers ieder een passende eigen omgeving.","control":"Toegangsrechten worden per rol ingericht.","tags":["inloggen","gebruikers","rollen","portaal"]},
+        {"id":"portal-client","title":"Klantportaal","benefit":"Laat een klant zelf relevante documenten of voortgang zien.","control":"De klant ziet alleen zijn eigen gegevens en afgesproken onderdelen.","tags":["klantportaal","documenten","voortgang","inloggen"]},
+        {"id":"portal-log","title":"Historie en logboek","benefit":"Maak zichtbaar wat is veranderd en waarom.","control":"Logs zijn inzichtelijk maar niet zomaar te wijzigen.","tags":["logboek","historie","audit","dashboard"]}
+      ]
+    },
+    {
+      "id": "marketplaces",
+      "title": "Advertenties, voorraad en marketplaces",
+      "items": [
+        {"id":"marketplace-draft","title":"Advertentieconcepten uit foto's en mappen","benefit":"Maak sneller een eerste opzet voor veel productaanbod.","control":"De verkoper kiest wat wordt gebruikt of gepubliceerd.","tags":["advertentie","foto","ebay","marketplace"]},
+        {"id":"marketplace-copy","title":"Titels, beschrijvingen en categorieën voorbereiden","benefit":"Zet productinformatie klaar zonder telkens vanaf nul te schrijven.","control":"Twijfel of ontbrekende feiten worden gemarkeerd.","tags":["advertentie","titel","beschrijving","categorie"]},
+        {"id":"marketplace-bulk","title":"Productgegevens in bulk aanpassen","benefit":"Werk veel vergelijkbare regels tegelijk bij.","control":"Wijzigingen worden eerst als concept of voorbeeld getoond.","tags":["csv","bulk","voorraad","product"]},
+        {"id":"marketplace-review","title":"Onzekere velden markeren","benefit":"Zorg dat twijfel niet stilzwijgend als feit wordt ingevuld.","control":"Onzekerheden blijven in beeld totdat iemand ze oplost.","tags":["advertentie","controle","review"]},
+        {"id":"marketplace-channel","title":"Kanaalroute onderzoeken","benefit":"Kijk per marketplace naar een toegestane API-, feed- of CSV-route.","control":"Alleen een bevestigde route wordt gebouwd.","tags":["marketplace","api","feed","csv","koppeling"]}
+      ]
+    },
+    {
+      "id": "data",
+      "title": "Bestanden, gegevens en rapportages",
+      "items": [
+        {"id":"data-organize","title":"Bestanden benoemen en ordenen","benefit":"Maak documenten sneller terug te vinden zonder handmatig hernoemen.","control":"Bestaande namen en mappen worden niet onbedoeld overschreven.","tags":["bestand","map","document","ordenen"]},
+        {"id":"data-extract","title":"Informatie uit documenten verzamelen","benefit":"Zet bruikbare velden uit veel documenten in een overzicht.","control":"Twijfel en lege waarden worden apart gemarkeerd.","tags":["document","pdf","uitlezen","gegevens"]},
+        {"id":"data-combine","title":"Exports uit meerdere systemen combineren","benefit":"Maak een overzicht zonder steeds verschillende bestanden aan elkaar te plakken.","control":"De bron en laatste update blijven zichtbaar.","tags":["export","rapport","systeem","data"]},
+        {"id":"data-migrate","title":"Oude gegevens migreren","benefit":"Breng oude administratie, dossiers of lijsten naar een nieuwe bruikbare vorm.","control":"Een controlebestand vergelijkt aantallen, missende regels en afwijkingen.","tags":["migratie","oude software","data","excel"]},
+        {"id":"data-report","title":"Periodiek rapport klaarzetten","benefit":"Maak een terugkerend overzicht zonder iedere maand opnieuw verzamelen.","control":"De gebruiker ziet welke gegevens in het rapport zijn meegenomen.","tags":["rapport","dashboard","periodiek","overzicht"]}
+      ]
+    },
+    {
+      "id": "werkplek",
+      "title": "Digitale werkplek en interne kennis",
+      "items": [
+        {"id":"workplace-actions","title":"Mail en notities naar actiepunten","benefit":"Zet actiepunten op de plek waar iemand ermee verder kan.","control":"De gebruiker houdt het laatste woord over taak en afspraak.","tags":["mail","notities","actiepunten","agenda"]},
+        {"id":"workplace-template","title":"Documenten uit vaste sjablonen","benefit":"Vul bekende gegevens automatisch in een bruikbaar document.","control":"De inhoud blijft te controleren en te wijzigen.","tags":["document","sjabloon","offerte","rapport"]},
+        {"id":"workplace-approval","title":"Goedkeuringsronde organiseren","benefit":"Maak duidelijk wie een document, aanvraag of taak nog moet beoordelen.","control":"Alleen bevoegde personen kunnen goedkeuren.","tags":["goedkeuring","controle","workflow"]},
+        {"id":"workplace-knowledge","title":"Interne kennisassistent","benefit":"Laat medewerkers sneller goedgekeurde werkinformatie vinden.","control":"Bronnen zijn afgebakend en onzekere antwoorden worden gemeld.","tags":["kennisbank","ai","interne kennis","helpdesk"]},
+        {"id":"workplace-browser","title":"Terugkerende browserhandeling ondersteunen","benefit":"Verminder repetitief klikwerk wanneer een betere directe route niet beschikbaar is.","control":"Eerst wordt onderzocht of een stabielere koppeling of export mogelijk is.","tags":["browser","klikwerk","automatisering","koppeling"]}
+      ]
+    },
+    {
+      "id": "website",
+      "title": "Website en zelfservice",
+      "items": [
+        {"id":"web-intake","title":"Slim intakeformulier","benefit":"Laat een klant direct bruikbare informatie aanleveren.","control":"Een medewerker beoordeelt volledigheid en vervolg.","tags":["website","formulier","intake","lead"]},
+        {"id":"web-upload","title":"Documenten laten aanleveren","benefit":"Maak het eenvoudiger om juiste bestanden bij een aanvraag te krijgen.","control":"Bestandstypen, toegang en bewaartermijn worden afgestemd.","tags":["website","upload","document","klant"]},
+        {"id":"web-status","title":"Status via een portaal tonen","benefit":"Geef klanten minder reden om achter updates aan te bellen of mailen.","control":"Statusinformatie is beperkt tot wat veilig en afgesproken is.","tags":["website","portaal","status","klant"]},
+        {"id":"web-backoffice","title":"Websiteaanvraag naar backoffice sturen","benefit":"Zorg dat een aanvraag meteen bij de juiste werklijst komt.","control":"De toewijzing is te corrigeren.","tags":["website","aanvraag","backoffice","taak"]},
+        {"id":"web-advice","title":"Rapport of advies op basis van invoer","benefit":"Maak een eerste, bewerkbare uitkomst van bekende invoer.","control":"De uitkomst blijft een voorstel wanneer gegevens of regels onzeker zijn.","tags":["website","advies","rapport","calculator"]}
+      ]
+    }
+  ],
+  "guardrails": {
+    "max_suggestions": 3,
+    "max_follow_up_questions_before_summary": 4,
+    "always_offer_submit": true,
+    "price_policy": "Nooit automatisch een definitieve prijs geven. Alleen intern een complexiteitssignaal meegeven.",
+    "high_impact_control": ["betalingen", "boekingen", "klantcommunicatie", "offertes", "erp", "planning", "productie", "publiceren", "verwijderen"],
+    "official_lookup_only": "Bij een genoemd programma alleen officiële website, helpomgeving of ontwikkelaarsdocumentatie raadplegen voor API, import, export of integratie."
+  }
+}
