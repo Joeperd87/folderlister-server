@@ -320,6 +320,22 @@ def web_editor() -> HTMLResponse:
   <span id="reviseBanner">✏️ EDIT MODE — revising existing listing</span>
 </header>
 
+<section style="margin:12px;padding:12px;border:1px solid #FDB913;border-radius:8px">
+  <label><input type="checkbox" id="guideEnabled"> Guide me through the final review</label>
+  <div id="guideContent" hidden>
+    <h2 style="font-size:18px;margin:10px 0 6px">Final review — nothing is live yet</h2>
+    <p id="guideText" aria-live="polite"></p>
+    <button id="guideCheck">Check my batch</button>
+    <p id="guideIssues" aria-live="polite"></p>
+    <p>Check photos, condition, required item specifics, shipping, returns and location.
+       Use the row checkboxes to choose what to publish. The Publish button sends those items to eBay.</p>
+  </div>
+</section>
+<section id="publishResults" hidden style="margin:12px;padding:12px;border:1px solid #8fbcc9;border-radius:8px" aria-live="polite">
+  <h2 style="font-size:18px">Publication results</h2>
+  <p id="publishSummary"></p><ul id="publishResultList"></ul>
+</section>
+
 <div id="controls">
   <button id="editHtml">Edit HTML…</button>
   <button id="publishSel" class="dark">Publish selected</button>
@@ -578,6 +594,115 @@ def web_editor() -> HTMLResponse:
     return 'https://' + dom + '/bp/manage';
   }
   let lastRows = [];
+  let publicationBusy = false;
+  const guideToggle = document.getElementById('guideEnabled');
+  let savedGuide = false;
+  try { savedGuide = localStorage.getItem('fl.finalReviewGuide') === '1'; } catch (_) {}
+  guideToggle.checked = params.has('guide') ? params.get('guide') === '1' : savedGuide;
+  function updateGuide(){
+    document.getElementById('guideContent').hidden = !guideToggle.checked;
+    const pending = lastRows.filter(r => !r._published);
+    document.getElementById('guideText').textContent = pending.length
+      ? `${pending.length} items to review for eBay ${SITE} (${CURRENCY}). Check the batch below before publishing. Scheduling is shown in each row.`
+      : 'No unpublished items in this batch. After publishing, review the results below or return to Folder Lister for your next batch.';
+  }
+  guideToggle.addEventListener('change', () => {
+    try { localStorage.setItem('fl.finalReviewGuide', guideToggle.checked ? '1' : '0'); } catch (_) {}
+    try {
+      const url = new URL(location.href); url.searchParams.set('guide', guideToggle.checked ? '1' : '0');
+      history.replaceState(null, '', url);
+    } catch (_) {}
+    updateGuide();
+  });
+  function reviewIssues(row){
+    const issues = [];
+    const title = String(row.title || '').trim();
+    if (!title || title.length > 80) issues.push(['title', 'Use a title of 1–80 characters']);
+    if (!String(row.category_id || '').match(/^\d+$/)) issues.push(['category_id', 'Choose a category']);
+    if (!(row.picture_urls || row.pictures || []).length) issues.push(['_thumb', 'Add at least one photo']);
+    if (!ismulti(row)) {
+      if (!Number.isFinite(Number(row.price)) || Number(row.price) <= 0) issues.push(['price', 'Enter a price greater than zero']);
+      if (!Number.isInteger(Number(row.quantity)) || Number(row.quantity) < 1) issues.push(['quantity', 'Enter a whole quantity of at least one']);
+    }
+    if (!row.is_revise && !_noPolicies) {
+      for (const [field, label] of [['shipping_profile','shipping policy'], ['return_profile','return policy'], ['payment_profile','payment policy'], ['location','item location'], ['postal_code','postal code']]) {
+        if (!String(row[field] || POL.defaults[field] || '').trim()) issues.push([field, `Check your ${label}`]);
+      }
+    }
+    return issues;
+  }
+  document.getElementById('guideCheck').addEventListener('click', () => {
+    const target = document.getElementById('guideIssues');
+    target.replaceChildren();
+    const rows = lastRows.filter(r => !r._published);
+    if (!rows.length) { target.textContent = 'There are no unpublished items to check.'; return; }
+    let count = 0;
+    for (const row of rows) {
+      for (const [field, message] of reviewIssues(row)) {
+        count++;
+        const button = document.createElement('button');
+        button.textContent = `${row.title || 'Untitled item'}: ${message}`;
+        button.style.display = 'block';
+        button.style.margin = '4px 0';
+        button.addEventListener('click', () => {
+          const selection = new Set(selectedRows());
+          SHOW_HIDDEN = true;
+          document.getElementById('toggleHidden').checked = true;
+          hiddenColsPref = hiddenColsPref.filter(k => k !== field);
+          renderTable(lastRows);
+          document.querySelectorAll('#grid input.rowSel').forEach(cb => {
+            cb.checked = selection.has(cb.closest('tr').__rowObj);
+          });
+          const tr = Array.from(document.querySelectorAll('#grid tr')).find(el => el.__rowObj === row);
+          if (!tr) return;
+          const cell = Array.from(tr.cells).find(el => el.dataset.field === field);
+          (cell || tr).scrollIntoView({block:'center', inline:'center'});
+          const input = cell && cell.querySelector('input,select,button');
+          if (input) input.focus();
+        });
+        target.appendChild(button);
+      }
+    }
+    if (_noPolicies && !_qpValidate()) {
+      count++;
+      const b = document.createElement('button'); b.textContent = 'Complete shipping, returns and location';
+      b.onclick = () => document.getElementById('quickPostPanel').scrollIntoView({block:'center'});
+      target.appendChild(b);
+    }
+    if (!count) target.textContent = 'Basic checks passed. Please also review condition, descriptions and required item specifics. eBay performs its own checks when you publish.';
+    updateGuide();
+  });
+  function showPublicationResults(rows, results, uncertain=false){
+    const panel = document.getElementById('publishResults'); panel.hidden = false;
+    const list = document.getElementById('publishResultList'); list.replaceChildren();
+    const ok = results.filter(r => r && r.ok).length;
+    document.getElementById('publishSummary').textContent = `${ok} of ${rows.length} items confirmed successful.` +
+      (uncertain ? ' Some outcomes are unknown. Check Seller Hub before retrying those items to avoid duplicates.' : ' Successful items are excluded from another publication in this session.');
+    rows.forEach((row, i) => {
+      const result = results[i];
+      const li = document.createElement('li');
+      li.textContent = `${row.title || 'Untitled item'} — ${result && result.ok ? (row.schedule_time ? 'Scheduled' : 'Published') : (result && result.error || (row._publicationUnknown ? 'Outcome unknown: check Seller Hub before retrying' : 'Not sent'))}`;
+      if (result && result.ok && /^\d+$/.test(String(result.item_id || ''))) {
+        const a = document.createElement('a'); a.textContent = ' View on eBay';
+        a.href = `https://${_EBAY_DOMAIN[SITE] || 'www.ebay.com'}/itm/${result.item_id}`;
+        a.target = '_blank'; a.rel = 'noopener'; li.appendChild(a);
+      }
+      if (row._publicationUnknown) {
+        const check = document.createElement('button');
+        check.textContent = 'I checked eBay: this item was not published';
+        check.onclick = () => {
+          if (confirm('Only continue after checking active and scheduled listings in Seller Hub. Did you confirm this item was NOT published?')) {
+            row._publicationUnknown = false;
+            check.disabled = true;
+            check.textContent = 'Ready to retry after your check';
+          }
+        };
+        li.appendChild(check);
+      }
+      list.appendChild(li);
+    });
+    updateGuide();
+  }
   let showPublishedRows = false; // false = published items hidden, true = visible (toggled)
   function updatePublishedToggle() {
     const btn = document.getElementById('btnTogglePublished');
@@ -709,8 +834,20 @@ function postJSON(url, body){
   function utcMinuteIso(d){
     return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}T${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:00Z`;
   }
+  // Zou deze rij verplaatst worden? Leest alleen, verandert niets.
+  function scheduleIsInThePast(row){
+    const v = row && row.schedule_time;
+    if (!v) return false;
+    const d = (/Z$/i.test(v) || /[+-]\d{2}:?\d{2}$/.test(v)) ? new Date(v) : parseLocalMinute(v);
+    if (!d || isNaN(d.getTime())) return false;
+    return d.getTime() < Date.now() + 60*1000;
+  }
   // Normaliseer row.schedule_time naar UTC en bump zo nodig naar “nu+1m”
   function ensureUtcSchedule(row){
+    // Per aanroep opnieuw bepalen. Bleef deze vlag staan, dan meldde de
+    // volgende poging opnieuw "verplaatst naar nu" terwijl de gecorrigeerde
+    // tijd gewoon in de toekomst lag.
+    row._schedule_bumped = false;
     const v = row.schedule_time;
     if (!v){ row.schedule_time_utc = null; return; }
     let d = null;
@@ -1319,6 +1456,7 @@ function conditionAllowsDescription(label, allowedList){
       for (let ci=0; ci<targetCols.length; ci++){
         const c = targetCols[ci];
         const td = document.createElement('td');
+        td.dataset.field = c.key;
         if (c.cls) td.classList.add(c.cls);
         if (c.sticky){
           if (c.cls === 'selbox'){ td.style.left='0'; td.style.position='sticky'; td.style.zIndex='3'; }
@@ -2514,6 +2652,7 @@ r.aspects = asp || {}; r.aspects[k] = valRaw || null;
       .then(() => loadPolicies())
       .then(() => {
         applyPolicyAndLocationDefaults(lastRows);
+        updateGuide();
 
         // Normaliseer condition naar toegestane label
         for (const r of lastRows){
@@ -2597,6 +2736,13 @@ try{
 
 
   function publish(rows){
+    if (publicationBusy) return;
+    rows = (rows || []).filter(r => r && !r._published);
+    if (!rows.length) { status('Choose at least one unpublished item.'); return; }
+    if (rows.some(r => r._publicationUnknown)) {
+      alert('Some selected items have an unknown publication outcome. Check Seller Hub before retrying them. Uncheck those rows to publish other items.');
+      return;
+    }
     // Quick-post path: validate the inline-policy panel, then inject the
     // fields into every row before sending to /web/publish.
     let _qpFields = null;
@@ -2773,24 +2919,25 @@ if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
       }
     }
 
-    // Convert to UTC + bump if needed (after conversion)
-    let bumpedCount = 0;
-    rows.forEach(r => {
-      ensureUtcSchedule(r);
-      if (r._schedule_bumped) bumpedCount++;
-    });
+    if (!rows || !rows.length){ alert('Selecteer rijen.'); return; }
+
+    // Alleen tellen, nog niets veranderen: wie hieronder op Annuleren
+    // drukte, hield eerder toch rijen over die naar “nu” waren gezet.
+    const wouldBump = rows.filter(scheduleIsInThePast).length;
+    if (wouldBump > 0){
+      alert(`${wouldBump} listing(s) have a scheduled time in the past (after timezone conversion). Continue and they are moved to “now”.`);
+    }
+
+    if (!confirm(`Publish ${rows.length} item(s) to eBay ${SITE}?\n\nCheck prices, photos, shipping and any scheduled times before continuing.`)) return;
+
+    // Bevestigd: nu pas naar UTC omzetten en zo nodig bumpen.
+    rows.forEach(ensureUtcSchedule);
 
     // Normalize rows BEFORE sending
     rows = (rows || []).map(_normalizeRow);
-
-    if (!rows || !rows.length){ alert('Selecteer rijen.'); return; }
     let clientTZ = null;
     try { clientTZ = Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch(_){}
-
-    if (bumpedCount > 0){
-      alert(`${bumpedCount} listing(s) had a scheduled time in the past (after timezone conversion). They were moved to “now”.`);
-    }
-
+    publicationBusy = true;
     // Overlay on
     showPublishOverlay('Publishing to eBay…');
     status('Publishing ' + rows.length + ' rows…');
@@ -2815,6 +2962,7 @@ if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
           status(`Publishing ${doneAfter}/${total} rows… (batch ${batchIndex})`);
           setPublishOverlayProgress(doneAfter, total);
 
+          batch.forEach(r => { r._publicationUnknown = true; });
           const res = await postJSON('/web/publish', {
             site: SITE,
             currency: CURRENCY,
@@ -2832,18 +2980,38 @@ if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
               'Publish failed (no response).';
 
             alert(`Publish failed for batch ${batchIndex}.\n\n${extra}`);
+            showPublicationResults(rows, allResults, true);
             return;
           }
 
           const items = Array.isArray(res.results) ? res.results : [];
+          // Record each confirmed chunk immediately, even if a later chunk fails.
+          batch.forEach((row, index) => {
+            const result = items[index];
+            if (result && typeof result.ok === 'boolean') row._publicationUnknown = false;
+            if (result && result.ok) {
+              row._published = true;
+              row._published_item_id = result.item_id || '';
+            }
+          });
           allResults  = allResults.concat(items);
+          updatePublishedToggle();
+          renderBody();
+          if (items.length !== batch.length) {
+            showPublicationResults(rows, allResults, true);
+            return;
+          }
         }
       } catch (err) {
         console.error(err);
         hidePublishOverlay();
         status('Failed');
         alert('Publish failed (network error while talking to the server).');
+        showPublicationResults(rows, allResults, true);
         return;
+      } finally {
+        publicationBusy = false;
+        hidePublishOverlay();
       }
 
       // ---- alle batches klaar: zelfde resultaatlogica als voorheen ----
@@ -2882,6 +3050,7 @@ if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
         msg += `\n\nFailures:\n${lines.join('\n')}`;
       }
       alert(msg);
+      showPublicationResults(rows, items);
 
       // Open de juiste eBay pagina:
       // -> alleen naar "scheduled" als ÁLLE listings gepland zijn; anders "active"
@@ -2989,7 +3158,8 @@ if (asp2 && typeof asp2 === 'object' && !Array.isArray(asp2)){
     if(bb) bb.textContent='UI geladen…';
   }catch(_){}
   console.log('[editor] init wired');
-  loadSite().then(() => build());
+  updateGuide();
+  loadSite().then(() => build()).then(updateGuide);
 })();
 </script>
 </body>
